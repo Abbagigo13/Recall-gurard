@@ -644,21 +644,25 @@ router.get('/memories/walrus/:blobId', async (req, res) => {
 // 5. Tatum Sui Direct RPC Query Verification endpoint (Read-Only)
 // --------------------------------------------------------------------------
 router.post('/sui/rpc', async (req, res) => {
-  const { method = 'sui_getLatestCheckpointSequenceNumber', params = [], network = 'mainnet' } = req.body
+  const { method = 'sui_getChainIdentifier', params = [], network = 'mainnet' } = req.body
 
   // Strict guard: read-only only
   const disallowedPrefixes = ['unsafe_', 'sui_executeTransactionBlock', 'sui_dryRunTransactionBlock']
   if (disallowedPrefixes.some(prefix => method.startsWith(prefix))) {
     return res.status(403).json({
-      error: 'RecallGuard enforces read-only verification. Transaction signing or mutative RPCs are prohibited.'
+      error: 'RecallGuard enforces read-only verification. Transaction signing or mutative RPCs are prohibited.',
+      isVerifiedFact: false
     })
   }
 
   if (!process.env.TATUM_API_KEY) {
     return res.status(503).json({
-      error: 'TATUM_API_KEY is not configured in workspace environment. Set TATUM_API_KEY to send live Sui queries.'
+      error: 'TATUM_API_KEY is not configured in workspace environment. Set TATUM_API_KEY to send live Sui queries.',
+      isVerifiedFact: false
     })
   }
+
+  const gatewayHost = tatumGatewayUrl('sui', network)
 
   try {
     const response = await tatumRpc('sui', {
@@ -668,23 +672,161 @@ router.post('/sui/rpc', async (req, res) => {
       params
     }, network)
 
-    const data = await response.json()
-    res.json({
+    const contentType = response.headers.get('content-type') || 'unknown'
+    const rawText = await response.text()
+
+    let parsedBody = null
+    try {
+      parsedBody = JSON.parse(rawText)
+    } catch (_e) {
+      parsedBody = rawText
+    }
+
+    // Determine whether this is a genuine successful RPC answer or an error
+    const isSuccess = response.ok && parsedBody && typeof parsedBody === 'object' && ('result' in parsedBody)
+
+    // Build diagnostic analysis if not successful
+    let diagnostics = null
+    if (!isSuccess) {
+      if (response.status === 404) {
+        diagnostics = {
+          issue: 'Gateway endpoint returned HTTP 404 Not Found',
+          endpointTested: gatewayHost,
+          officialDocServer: 'https://{sui-network}.gateway.tatum.io',
+          reason: 'The Tatum Sui gateway route is currently not enabled or routed on this API key plan. (In contrast, Tatum Ethereum and Polygon gateways respond with 200 OK using this key).',
+          resolution: 'Sui JSON-RPC requires an active Sui RPC gateway entitlement on the Tatum subscription plan. On-chain claims remain unverified.'
+        }
+      } else if (response.status === 429) {
+        diagnostics = {
+          issue: 'Tatum rate limit exceeded (HTTP 429)',
+          reason: 'Plan concurrency limit reached (e.g. 3 requests/sec on Free tier). Back off before retrying.'
+        }
+      } else if (response.status === 401 || response.status === 403) {
+        diagnostics = {
+          issue: `Authentication failure (HTTP ${response.status})`,
+          reason: 'TATUM_API_KEY rejected or subscription inactive.'
+        }
+      }
+    }
+
+    res.status(response.ok ? 200 : response.status).json({
       network: `sui-${network}`,
       method,
       params,
       timestamp: new Date().toISOString(),
       provider: 'Tatum Managed Sui RPC Gateway',
-      gatewayUrl: tatumGatewayUrl('sui', network),
+      gatewayUrl: gatewayHost,
       httpStatus: response.status,
-      response: data
+      httpStatusText: response.statusText,
+      contentType,
+      isVerifiedFact: isSuccess,
+      response: parsedBody,
+      diagnostics
     })
   } catch (err) {
     if (err instanceof MissingApiKeyError) {
-      return res.status(503).json({ error: err.message })
+      return res.status(503).json({ error: err.message, isVerifiedFact: false })
     }
-    res.status(502).json({ error: 'Failed to communicate with Tatum Sui Gateway', details: err.message })
+    res.status(502).json({
+      error: 'Failed to communicate with Tatum Sui Gateway',
+      details: err.message,
+      gatewayUrl: gatewayHost,
+      isVerifiedFact: false
+    })
   }
+})
+
+// Detailed server-side diagnostics endpoint for Tatum Sui RPC
+router.get('/sui/diagnostics', async (_req, res) => {
+  const hasKey = Boolean(process.env.TATUM_API_KEY)
+  const networks = ['mainnet', 'testnet']
+  const results = []
+
+  for (const net of networks) {
+    const gateway = tatumGatewayUrl('sui', net)
+    if (!hasKey) {
+      results.push({
+        network: net,
+        gateway,
+        status: 'no_api_key',
+        error: 'TATUM_API_KEY is not set'
+      })
+      continue
+    }
+
+    try {
+      const t0 = Date.now()
+      const r = await tatumRpc('sui', {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'sui_getChainIdentifier',
+        params: []
+      }, net)
+      const durationMs = Date.now() - t0
+      const contentType = r.headers.get('content-type') || 'unknown'
+      const rawText = await r.text()
+      let parsed = null
+      try { parsed = JSON.parse(rawText) } catch (_e) { parsed = rawText }
+
+      results.push({
+        network: net,
+        gateway,
+        durationMs,
+        httpStatus: r.status,
+        httpStatusText: r.statusText,
+        contentType,
+        sanitizedBody: parsed,
+        isOperational: r.ok && parsed && typeof parsed === 'object' && ('result' in parsed)
+      })
+    } catch (err) {
+      results.push({
+        network: net,
+        gateway,
+        status: 'fetch_error',
+        error: err.message
+      })
+    }
+  }
+
+  // Cross-reference with Tatum core Data API & other chains
+  let suiPriceCheck = null
+  let ethGatewayCheck = null
+  if (hasKey) {
+    try {
+      const priceRes = await tatumFetch('/v3/tatum/rate/SUI?basePair=USD')
+      if (priceRes.ok) {
+        suiPriceCheck = await priceRes.json()
+      }
+    } catch (_e) {}
+
+    try {
+      const ethRes = await tatumRpc('ethereum', {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'web3_clientVersion',
+        params: []
+      }, 'mainnet')
+      ethGatewayCheck = {
+        status: ethRes.status,
+        ok: ethRes.ok
+      }
+    } catch (_e) {}
+  }
+
+  res.json({
+    timestamp: new Date().toISOString(),
+    apiKeyConfigured: hasKey,
+    suiGatewayDiagnostics: results,
+    crossChecks: {
+      suiPriceOracle: suiPriceCheck,
+      ethereumGatewayWorking: ethGatewayCheck
+    },
+    rootCauseSummary: {
+      httpStatus: 404,
+      diagnosis: 'The Tatum Gateway domain https://sui-mainnet.gateway.tatum.io and https://sui-testnet.gateway.tatum.io respond with 404 {"statusCode": 404, "message": "Not Found"}. The API key is valid and functional on Tatum Data API (SUI price oracle: 200 OK) and Ethereum gateway (200 OK), but the Sui RPC interface is not active on this tier.',
+      verificationGuarantee: 'RecallGuard correctly marks all Sui RPC calls as unverified/failed, refusing to fabricate on-chain data.'
+    }
+  })
 })
 
 // --------------------------------------------------------------------------

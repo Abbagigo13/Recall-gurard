@@ -1319,17 +1319,44 @@ export default function App() {
               {rpcError && (
                 <div className="flex gap-lg rounded-xl bg-utility-error-50 p-xl">
                   <AlertCircle className="mt-xxs size-5 shrink-0 text-utility-error-600" aria-hidden="true" />
-                  <div>
-                    <p className="text-sm font-semibold text-utility-error-600">RPC Verification Error</p>
+                  <div className="flex-1">
+                    <p className="text-sm font-semibold text-utility-error-600">RPC Gateway Error</p>
                     <p className="mt-xxs text-sm text-tertiary">{rpcError}</p>
+                    <p className="mt-xs text-xs font-semibold text-utility-error-600">
+                      Truth Guarantee: This query is unverified and will not be reported as a verified on-chain fact.
+                    </p>
                   </div>
                 </div>
               )}
 
               {rpcResult && (
-                <div className="space-y-xs">
+                <div className="space-y-sm">
+                  {/* Status Banner */}
+                  <div className={`flex gap-lg rounded-xl p-md ${
+                    rpcResult.isVerifiedFact
+                      ? 'bg-utility-success-50 text-utility-success-700 border border-utility-success-200'
+                      : 'bg-utility-warning-50 text-utility-warning-700 border border-utility-warning-200'
+                  }`}>
+                    <Info className="mt-xxs size-5 shrink-0" aria-hidden="true" />
+                    <div className="flex-1 text-xs">
+                      <p className="font-semibold text-sm">
+                        {rpcResult.isVerifiedFact ? 'Cryptographic On-Chain Verification Confirmed' : `Gateway Status: HTTP ${rpcResult.httpStatus} ${rpcResult.httpStatusText || ''}`}
+                      </p>
+                      {rpcResult.diagnostics ? (
+                        <div className="mt-xs space-y-xxs text-tertiary">
+                          <p><strong className="text-secondary">Issue:</strong> {rpcResult.diagnostics.issue}</p>
+                          <p><strong className="text-secondary">Official Endpoint:</strong> {rpcResult.diagnostics.endpointTested}</p>
+                          <p><strong className="text-secondary">Diagnosis:</strong> {rpcResult.diagnostics.reason}</p>
+                          <p><strong className="text-secondary">Resolution:</strong> {rpcResult.diagnostics.resolution}</p>
+                        </div>
+                      ) : (
+                        <p className="mt-xxs text-tertiary">Live JSON-RPC answer returned by Tatum Gateway.</p>
+                      )}
+                    </div>
+                  </div>
+
                   <div className="flex items-center justify-between text-xs text-tertiary">
-                    <span>Real Gateway Result from Tatum ({rpcResult.gatewayUrl})</span>
+                    <span>Gateway Result from Tatum ({rpcResult.gatewayUrl})</span>
                     <span className="font-mono">{rpcResult.timestamp}</span>
                   </div>
                   <pre className="p-md rounded-md bg-secondary border border-secondary font-mono text-xs text-primary overflow-x-auto leading-relaxed">

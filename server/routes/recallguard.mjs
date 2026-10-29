@@ -1,267 +1,342 @@
 import { Router } from 'express'
-import { tatumFetch, tatumRpc, MissingApiKeyError } from '../tatum-client.mjs'
+import { tatumFetch, tatumRpc, MissingApiKeyError, tatumGatewayUrl } from '../tatum-client.mjs'
 
 const router = Router()
 
-// In-memory runtime store for agent sessions, memories, evaluated claims, and audit timeline
-let sessions = [
+// Walrus endpoints from official testnet specification / environment
+const DEFAULT_WALRUS_AGGREGATOR = process.env.WALRUS_AGGREGATOR_URL || process.env.WALRUS_STORAGE_URL || 'https://aggregator.walrus-testnet.walrus.space'
+const DEFAULT_WALRUS_PUBLISHER = process.env.WALRUS_PUBLISHER_URL || 'https://publisher.walrus-testnet.walrus.space'
+
+// Seeded DEMO historical data (explicitly labeled provenance: 'demo_seed')
+const DEMO_SESSIONS = [
   {
-    id: 'SES-012',
+    id: 'DEMO-SES-001',
+    provenance: 'demo_seed',
     question: 'Verify latest Sui checkpoint sequence number, committee size, and epoch progression',
     status: 'completed',
-    createdAt: new Date(Date.now() - 14 * 60 * 1000).toISOString(),
+    createdAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
     confidence: 0.94,
-    recalledMemoryIds: ['MEM-001', 'MEM-004'],
+    recalledMemoryIds: ['DEMO-MEM-001', 'DEMO-MEM-002'],
     claims: [
       {
-        id: 'CLM-031',
-        text: 'Latest Sui Mainnet Checkpoint is active and finalized.',
+        id: 'DEMO-CLM-001',
+        text: 'Sui Mainnet Genesis Checkpoint digest is 35834a8a (simulated reference demo).',
         type: 'verified_fact',
-        source: 'Tatum Sui RPC (sui_getLatestCheckpointSequenceNumber)',
-        verifiedAt: new Date(Date.now() - 14 * 60 * 1000).toISOString(),
-        details: { method: 'sui_getLatestCheckpointSequenceNumber', network: 'sui-mainnet' }
+        source: 'Demo Seed Ground Truth',
+        verifiedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+        details: { method: 'sui_getChainIdentifier', network: 'sui-mainnet' }
       },
       {
-        id: 'CLM-032',
-        text: 'Walrus Testnet epoch transition occurs every 14 days with Reed-Solomon RedStuff blob encoding.',
+        id: 'DEMO-CLM-002',
+        text: 'Walrus uses 2D Reed-Solomon RedStuff encoding requiring 3f+1 sliver quorum.',
         type: 'verified_fact',
-        source: 'Walrus Protocol Specification (Blob Architecture)',
-        verifiedAt: new Date(Date.now() - 14 * 60 * 1000).toISOString(),
+        source: 'Walrus Protocol Specification (Whitepaper §3.2)',
+        verifiedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
         details: { blobEncoding: '2D Reed-Solomon', redundancy: '3f+1' }
       },
       {
-        id: 'CLM-033',
+        id: 'DEMO-CLM-003',
         text: 'DeepBook V3 liquidity pool package upgrades require multi-sig governance consensus.',
         type: 'unverified_claim',
-        source: 'Sui Community Discussion / Governance Proposal 44'
-      },
-      {
-        id: 'CLM-034',
-        text: 'Agent hypothesis: Staking collateral requirements on Sui storage nodes will steadily increase as Walrus Mainnet launches.',
-        type: 'ai_interpretation',
-        source: 'RecallGuard Epistemic Engine (Synthesized from MEM-003 and MEM-021)'
+        source: 'Sui Community Discussion (Demo Observation)'
       }
     ],
-    conclusion: 'On-chain Sui state verified through Tatum RPC shows stable network finality. Walrus testnet storage parameters remain aligned with spec v1.2.',
-    learningDelta: 'Reinforced weight on Tatum RPC data points (+0.04) and confirmed MEM-021 supersede status.'
+    conclusion: 'Demonstration inquiry showing multi-session memory recall. Live queries run below will be marked provenance: live_production.',
+    learningDelta: 'Reinforced epistemic weight on verifiable on-chain facts (+0.04).'
   },
   {
-    id: 'SES-011',
+    id: 'DEMO-SES-002',
+    provenance: 'demo_seed',
     question: 'What is the required minimum collateral for Walrus storage nodes on Sui?',
     status: 'completed',
-    createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    createdAt: new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString(),
     confidence: 0.91,
-    recalledMemoryIds: ['MEM-003'],
+    recalledMemoryIds: ['DEMO-MEM-003'],
     claims: [
       {
-        id: 'CLM-028',
-        text: 'Prior documentation claimed 5,000 SUI collateral.',
+        id: 'DEMO-CLM-004',
+        text: 'Preliminary devnet blog claimed 5,000 SUI collateral.',
         type: 'superseded_claim',
-        source: 'Deprecated Devnet Spec (MEM-003)'
+        source: 'Deprecated Devnet Spec (DEMO-MEM-003)'
       },
       {
-        id: 'CLM-029',
-        text: 'Current Sui Move package object 0x9f2a shows 10,000 SUI minimum stake requirement.',
+        id: 'DEMO-CLM-005',
+        text: 'Updated Sui smart contract package object showed 10,000 SUI minimum stake requirement.',
         type: 'verified_fact',
-        source: 'Tatum Sui RPC (sui_getObject)',
-        verifiedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()
+        source: 'On-Chain Move Package Inspection',
+        verifiedAt: new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString()
       }
     ],
-    conclusion: 'Agent updated conclusion from 5,000 SUI to 10,000 SUI based on direct on-chain contract state inspection via Tatum Sui RPC.',
-    learningDelta: 'Epistemic correction executed: Superseded MEM-003 with MEM-021. Confidence increased from 0.65 to 0.98.'
-  },
-  {
-    id: 'SES-010',
-    question: 'Tatum Sui RPC Gateway latency and gas price consistency test',
-    status: 'completed',
-    createdAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
-    confidence: 0.98,
-    recalledMemoryIds: [],
-    claims: [
-      {
-        id: 'CLM-025',
-        text: 'Reference gas price on Sui Mainnet is 1,000 MIST.',
-        type: 'verified_fact',
-        source: 'Tatum Sui RPC (suix_getReferenceGasPrice)',
-        verifiedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-      }
-    ],
-    conclusion: 'Sui Gateway responds within 42ms with consistent gas price telemetry.',
-    learningDelta: 'Established baseline latency metrics.'
+    conclusion: 'Agent updated conclusion from 5,000 SUI to 10,000 SUI based on direct on-chain contract state inspection.',
+    learningDelta: 'Epistemic correction: Superseded DEMO-MEM-003. Confidence increased from 0.65 to 0.98.'
   }
 ]
 
-let memories = [
+const DEMO_MEMORIES = [
   {
-    id: 'MEM-001',
-    category: 'on_chain_fact',
-    title: 'Sui Genesis Checkpoint Digest',
-    content: 'Sui genesis checkpoint digest verified via Tatum RPC with chain identifier 35834a8a.',
-    sourceReference: 'Tatum Sui RPC sui_getChainIdentifier',
-    walrusBlobId: 'mAlStJ4PAJaBuuHEUHotGheikLiTXpQagboGF43bY4s',
-    createdAt: new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString(),
-    status: 'active',
-    reliabilityScore: 0.99
-  },
-  {
-    id: 'MEM-002',
+    id: 'DEMO-MEM-001',
+    provenance: 'demo_seed',
     category: 'protocol_spec',
     title: 'Walrus RedStuff 2D Reed-Solomon Codec',
     content: 'Walrus uses 2D Reed-Solomon erasure coding (RedStuff) ensuring blob reconstruction with 3f+1 Byzantine fault tolerance.',
-    sourceReference: 'Walrus Whitepaper section 3.2',
-    walrusBlobId: 'b7xK9pqLmNvCdeFghIjKlMnOpQrStUvWxYzAbCdEfG',
-    createdAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+    sourceReference: 'Walrus Whitepaper v1.2',
+    walrusBlobId: 'demo_blob_redstuff_spec_v1',
+    createdAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
     status: 'active',
-    reliabilityScore: 0.95
+    reliabilityScore: 0.95,
+    storageVerified: false
   },
   {
-    id: 'MEM-003',
+    id: 'DEMO-MEM-002',
+    provenance: 'demo_seed',
+    category: 'on_chain_fact',
+    title: 'Sui Genesis Checkpoint Digest',
+    content: 'Sui genesis checkpoint digest verified via Tatum RPC with chain identifier 35834a8a.',
+    sourceReference: 'Tatum Sui RPC sui_getChainIdentifier (Reference)',
+    walrusBlobId: 'demo_blob_sui_genesis_ref',
+    createdAt: new Date(Date.now() - 36 * 60 * 60 * 1000).toISOString(),
+    status: 'active',
+    reliabilityScore: 0.99,
+    storageVerified: false
+  },
+  {
+    id: 'DEMO-MEM-003',
+    provenance: 'demo_seed',
     category: 'epistemic_stance',
     title: 'Walrus Storage Node Collateral (Deprecated)',
     content: 'Preliminary devnet estimate of 5,000 SUI collateral per storage node.',
     sourceReference: 'Walrus Devnet Draft Blog',
-    walrusBlobId: 'w1c88XyZaBcdEfGhIjKlMnOpQrStUvWxYzAbCdEfG',
-    createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+    walrusBlobId: 'demo_blob_deprecated_stake',
+    createdAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
     status: 'superseded',
-    supersededBy: 'MEM-021',
-    reliabilityScore: 0.40
+    supersededBy: 'DEMO-MEM-004',
+    reliabilityScore: 0.40,
+    storageVerified: false
   },
   {
-    id: 'MEM-004',
-    category: 'on_chain_fact',
-    title: 'Sui Active Validator Count Baseline',
-    content: 'Observed 104 active validators producing checkpoints on Sui Mainnet.',
-    sourceReference: 'Tatum Sui RPC suix_getLatestSuiSystemState',
-    walrusBlobId: 'q9L2mP0ZaBcdEfGhIjKlMnOpQrStUvWxYzAbCdEfG',
-    createdAt: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString(),
-    status: 'active',
-    reliabilityScore: 0.98
-  },
-  {
-    id: 'MEM-021',
+    id: 'DEMO-MEM-004',
+    provenance: 'demo_seed',
     category: 'on_chain_fact',
     title: 'Walrus Storage Node Minimum Collateral',
     content: 'Verified on-chain contract threshold requires 10,000 SUI minimum stake for active storage node participation.',
-    sourceReference: 'Tatum Sui RPC (Object 0x9f2a...) & Sui Move Package',
-    walrusBlobId: 'xP55qR9ZaBcdEfGhIjKlMnOpQrStUvWxYzAbCdEfG',
-    createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    sourceReference: 'Tatum Sui RPC & Sui Move Package',
+    walrusBlobId: 'demo_blob_sui_storage_stake',
+    createdAt: new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString(),
     status: 'active',
-    reliabilityScore: 0.98
+    reliabilityScore: 0.98,
+    storageVerified: false
   }
 ]
 
-let decisions = [
+const DEMO_DECISIONS = [
   {
-    id: 'DEC-004',
+    id: 'DEMO-DEC-001',
+    provenance: 'demo_seed',
     topic: 'Walrus Storage Node Minimum Collateral',
-    previousSessionId: 'SES-009',
-    currentSessionId: 'SES-011',
+    previousSessionId: 'DEMO-SES-001',
+    currentSessionId: 'DEMO-SES-002',
     priorClaim: 'Storage collateral is 5,000 SUI (Confidence: 65%) based on early devnet post.',
-    newClaim: 'Storage collateral is 10,000 SUI (Confidence: 98%) based on Tatum Sui RPC object state.',
+    newClaim: 'Storage collateral is 10,000 SUI (Confidence: 98%) based on Sui Move contract inspection.',
     changeReason: 'Direct verification of Sui smart contract package object revealed updated parameter. On-chain truth superseded off-chain community documentation.',
-    impact: 'Replaced MEM-003 with MEM-021 in persistent Walrus memory index.',
-    timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()
-  },
-  {
-    id: 'DEC-003',
-    topic: 'Sui Checkpoint Finality Time Guarantee',
-    previousSessionId: 'SES-007',
-    currentSessionId: 'SES-010',
-    priorClaim: 'Finality latency estimated at 1,200ms.',
-    newClaim: 'Observed sub-400ms transaction finality across 50 sample checkpoints via Tatum Gateway.',
-    changeReason: 'Measured empirical RPC latency telemetry directly through Tatum Sui Gateway.',
-    impact: 'Increased source reliability weight of Tatum Sui Gateway to 0.98.',
-    timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+    impact: 'Replaced DEMO-MEM-003 with DEMO-MEM-004 in persistent memory graph.',
+    timestamp: new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString()
   }
 ]
 
-// 1. System Status & Config info
-router.get('/config-status', async (_req, res) => {
+// Runtime mutable stores
+let sessions = [...DEMO_SESSIONS]
+let memories = [...DEMO_MEMORIES]
+let decisions = [...DEMO_DECISIONS]
+
+// --------------------------------------------------------------------------
+// 1. Health check & Integration Status Endpoint (/api/recallguard/health)
+// --------------------------------------------------------------------------
+router.get('/health', async (_req, res) => {
   const hasTatumKey = Boolean(process.env.TATUM_API_KEY)
-  const hasWalrusSdk = Boolean(process.env.WALRUS_API_KEY || process.env.WALRUS_STORAGE_URL)
-  
-  let tatumRpcStatus = 'unconfigured'
-  let tatumRpcError = null
-  let suiLatestCheckpoint = null
+  const walrusPublisherUrl = DEFAULT_WALRUS_PUBLISHER
+  const walrusAggregatorUrl = DEFAULT_WALRUS_AGGREGATOR
+
+  // Test Walrus Aggregator connectivity
+  let walrusAggregatorStatus = 'checking'
+  let walrusAggregatorLatencyMs = null
+  try {
+    const t0 = Date.now()
+    const aggRes = await fetch(`${walrusAggregatorUrl}/v1/blobs/nonexistent_test_probe`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(6000)
+    })
+    walrusAggregatorLatencyMs = Date.now() - t0
+    // 404 is normal and confirms the service is alive and listening
+    walrusAggregatorStatus = (aggRes.status === 404 || aggRes.ok) ? 'reachable' : `http-${aggRes.status}`
+  } catch (err) {
+    walrusAggregatorStatus = `unreachable: ${err.message}`
+  }
+
+  // Test Walrus Publisher connectivity
+  let walrusPublisherStatus = 'checking'
+  let walrusPublisherLatencyMs = null
+  try {
+    const t0 = Date.now()
+    const pubRes = await fetch(`${walrusPublisherUrl}/v1/blobs`, {
+      method: 'PUT',
+      body: 'probe',
+      signal: AbortSignal.timeout(6000)
+    })
+    walrusPublisherLatencyMs = Date.now() - t0
+    // 200 or 400 confirms endpoint is accepting HTTP requests
+    walrusPublisherStatus = pubRes.status === 200 || pubRes.status === 400 ? 'operational' : `http-${pubRes.status}`
+  } catch (err) {
+    walrusPublisherStatus = `unreachable: ${err.message}`
+  }
+
+  // Test Tatum Sui Gateway connectivity
+  let tatumRpcStatus = 'not_configured'
+  let tatumRpcLatencyMs = null
+  let tatumRpcDetails = null
 
   if (hasTatumKey) {
     try {
-      const response = await tatumRpc('sui', {
+      const t0 = Date.now()
+      const rpcRes = await tatumRpc('sui', {
         jsonrpc: '2.0',
         id: 1,
         method: 'sui_getLatestCheckpointSequenceNumber',
         params: []
       }, 'mainnet')
+      tatumRpcLatencyMs = Date.now() - t0
 
-      if (response.ok) {
-        const data = await response.json()
-        if (data.result) {
+      if (rpcRes.ok) {
+        const json = await rpcRes.json()
+        if (json.result) {
           tatumRpcStatus = 'connected'
-          suiLatestCheckpoint = data.result
+          tatumRpcDetails = { latestCheckpoint: json.result }
         } else {
-          tatumRpcStatus = 'rpc-error'
-          tatumRpcError = data.error?.message || 'RPC returned error'
+          tatumRpcStatus = 'rpc_error'
+          tatumRpcDetails = { error: json.error?.message || 'RPC returned error' }
         }
       } else {
-        tatumRpcStatus = 'http-error'
-        tatumRpcError = `Sui Gateway returned HTTP ${response.status} (${response.statusText}). Checkpoint inquiry requires active Sui gateway entitlement.`
+        tatumRpcStatus = `http_${rpcRes.status}`
+        tatumRpcDetails = { statusText: rpcRes.statusText }
       }
     } catch (err) {
       if (err instanceof MissingApiKeyError) {
-        tatumRpcStatus = 'missing-api-key'
+        tatumRpcStatus = 'missing_key'
       } else {
-        tatumRpcStatus = 'connection-failed'
-        tatumRpcError = err.message
+        tatumRpcStatus = 'network_error'
+        tatumRpcDetails = { error: err.message }
       }
     }
-  } else {
-    tatumRpcStatus = 'missing-api-key'
-    tatumRpcError = 'TATUM_API_KEY environment variable is not configured.'
   }
 
   res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    integrations: {
+      tatumSuiRpc: {
+        configured: hasTatumKey,
+        status: tatumRpcStatus,
+        latencyMs: tatumRpcLatencyMs,
+        details: tatumRpcDetails,
+        gatewayHost: tatumGatewayUrl('sui', 'mainnet')
+      },
+      walrusMemory: {
+        configured: true,
+        publisherUrl: walrusPublisherUrl,
+        publisherStatus: walrusPublisherStatus,
+        publisherLatencyMs: walrusPublisherLatencyMs,
+        aggregatorUrl: walrusAggregatorUrl,
+        aggregatorStatus: walrusAggregatorStatus,
+        aggregatorLatencyMs: walrusAggregatorLatencyMs,
+        pythonPackage: 'memwal',
+        encoding: 'RedStuff 2D Reed-Solomon'
+      }
+    },
+    counts: {
+      totalSessions: sessions.length,
+      realSessions: sessions.filter(s => s.provenance === 'live_production').length,
+      demoSessions: sessions.filter(s => s.provenance === 'demo_seed').length,
+      totalMemories: memories.length,
+      realMemories: memories.filter(m => m.provenance === 'live_production').length,
+      demoMemories: memories.filter(m => m.provenance === 'demo_seed').length
+    }
+  })
+})
+
+// Config status for UI badges
+router.get('/config-status', async (_req, res) => {
+  const hasTatumKey = Boolean(process.env.TATUM_API_KEY)
+  res.json({
     hasTatumKey,
-    hasWalrusSdk,
-    tatumRpcStatus,
-    tatumRpcError,
-    suiLatestCheckpoint,
+    hasWalrusSdk: true,
+    walrusPublisher: DEFAULT_WALRUS_PUBLISHER,
+    walrusAggregator: DEFAULT_WALRUS_AGGREGATOR,
     memwalAdapter: {
       pythonSdkPackage: 'memwal',
       version: '0.2.1-compatible',
-      mode: process.env.WALRUS_STORAGE_URL ? 'live-walrus-node' : 'hybrid-tatum-walrus',
+      mode: 'live-walrus-http-bridge',
       storageEngine: 'Walrus RedStuff 2D Reed-Solomon'
     }
   })
 })
 
-// 2. Metrics overview
+// --------------------------------------------------------------------------
+// 2. Metrics (Distinguishing Real vs Demo Evaluated Claims)
+// --------------------------------------------------------------------------
 router.get('/metrics', (_req, res) => {
+  const realSessions = sessions.filter(s => s.provenance === 'live_production')
+  const realMemories = memories.filter(m => m.provenance === 'live_production')
+  const realDecisions = decisions.filter(d => d.provenance === 'live_production')
+
+  const realEvaluatedClaims = realSessions.reduce((acc, s) => acc + s.claims.length, 0)
+  const realVerifiedFacts = realSessions.reduce((acc, s) => acc + s.claims.filter(c => c.type === 'verified_fact').length, 0)
+  const realSupersededClaims = realSessions.reduce((acc, s) => acc + s.claims.filter(c => c.type === 'superseded_claim').length, 0)
+
+  const realTotalVerifiable = realVerifiedFacts + realSupersededClaims
+  const realAccuracyScore = realTotalVerifiable > 0
+    ? Math.round((realVerifiedFacts / realTotalVerifiable) * 1000) / 10
+    : null
+
+  // Aggregated (including labeled demo seed)
   const totalSessions = sessions.length
   const totalMemories = memories.length
-  const evaluatedClaims = sessions.reduce((acc, s) => acc + s.claims.length, 0)
+  const totalClaims = sessions.reduce((acc, s) => acc + s.claims.length, 0)
   const verifiedFacts = sessions.reduce((acc, s) => acc + s.claims.filter(c => c.type === 'verified_fact').length, 0)
-  
-  // Real measured accuracy: proportion of verified facts to (verified facts + superseded claims)
   const supersededClaims = sessions.reduce((acc, s) => acc + s.claims.filter(c => c.type === 'superseded_claim').length, 0)
-  const totalVerifiableOutcomes = verifiedFacts + supersededClaims
-  const accuracyScore = totalVerifiableOutcomes > 0 
-    ? Math.round((verifiedFacts / totalVerifiableOutcomes) * 1000) / 10 
-    : 0
+  const totalVerifiable = verifiedFacts + supersededClaims
+  const overallAccuracyScore = totalVerifiable > 0
+    ? Math.round((verifiedFacts / totalVerifiable) * 1000) / 10
+    : null
 
   res.json({
-    totalSessions,
-    totalMemories,
-    evaluatedClaims,
-    verifiedFacts,
-    supersededClaims,
-    accuracyScore,
-    activeLearnedDecisions: decisions.length,
-    meanReliabilityIndex: 0.94
+    real: {
+      sessionsCount: realSessions.length,
+      memoriesCount: realMemories.length,
+      decisionsCount: realDecisions.length,
+      evaluatedClaims: realEvaluatedClaims,
+      verifiedFacts: realVerifiedFacts,
+      supersededClaims: realSupersededClaims,
+      accuracyScore: realAccuracyScore
+    },
+    aggregated: {
+      totalSessions,
+      totalMemories,
+      evaluatedClaims: totalClaims,
+      verifiedFacts,
+      supersededClaims,
+      accuracyScore: overallAccuracyScore,
+      decisionsCount: decisions.length
+    }
   })
 })
 
-// 3. Sessions List & Get
-router.get('/sessions', (_req, res) => {
+// --------------------------------------------------------------------------
+// 3. Research Workspace Sessions
+// --------------------------------------------------------------------------
+router.get('/sessions', (req, res) => {
+  const { provenance } = req.query
+  if (provenance && provenance !== 'all') {
+    return res.json(sessions.filter(s => s.provenance === provenance))
+  }
   res.json(sessions)
 })
 
@@ -271,36 +346,36 @@ router.get('/sessions/:id', (req, res) => {
   res.json(session)
 })
 
-// 4. Create new research session
 router.post('/sessions', async (req, res) => {
   const { question } = req.body
   if (!question || typeof question !== 'string') {
-    return res.status(400).json({ error: 'Question is required' })
+    return res.status(400).json({ error: 'Question string is required' })
   }
 
-  // 1. Recall relevant memories
-  const queryLower = question.toLowerCase()
+  // 1. Semantic memory recall from stored memories
+  const queryWords = question.toLowerCase().split(/\s+/).filter(w => w.length > 3)
   const matchedMemories = memories.filter(m => {
-    return queryLower.split(' ').some(word => word.length > 3 && (m.title.toLowerCase().includes(word) || m.content.toLowerCase().includes(word)))
+    const haystack = `${m.title} ${m.content}`.toLowerCase()
+    return queryWords.some(w => haystack.includes(w))
   })
   const recalledMemoryIds = matchedMemories.map(m => m.id)
 
-  // 2. Read live on-chain Sui data via Tatum RPC if available
+  // 2. Real Sui RPC verification via Tatum
   let onChainSuiData = null
   let onChainError = null
   let verifiedFactClaim = null
 
   if (process.env.TATUM_API_KEY) {
     try {
-      const rpcCall = await tatumRpc('sui', {
+      const rpcRes = await tatumRpc('sui', {
         jsonrpc: '2.0',
         id: Date.now(),
         method: 'sui_getLatestCheckpointSequenceNumber',
         params: []
       }, 'mainnet')
 
-      if (rpcCall.ok) {
-        const json = await rpcCall.json()
+      if (rpcRes.ok) {
+        const json = await rpcRes.json()
         if (json.result) {
           onChainSuiData = json.result
           verifiedFactClaim = {
@@ -312,16 +387,16 @@ router.post('/sessions', async (req, res) => {
             details: { checkpointSequence: json.result, network: 'sui-mainnet' }
           }
         } else {
-          onChainError = json.error?.message || 'RPC returned error'
+          onChainError = json.error?.message || 'RPC returned error object'
         }
       } else {
-        onChainError = `Gateway returned HTTP ${rpcCall.status}`
+        onChainError = `Sui Gateway HTTP ${rpcRes.status}: ${rpcRes.statusText}`
       }
     } catch (err) {
       onChainError = err.message
     }
   } else {
-    onChainError = 'TATUM_API_KEY is not configured in environment. Read-only verification pending.'
+    onChainError = 'TATUM_API_KEY not configured. Read-only verification was skipped.'
   }
 
   const claims = []
@@ -329,75 +404,125 @@ router.post('/sessions', async (req, res) => {
     claims.push(verifiedFactClaim)
   }
 
-  // Build claims based on question and recalled memories
   claims.push({
     id: `CLM-${Date.now().toString().slice(-3)}A`,
-    text: `Research target: "${question}" analyzed under active memory context.`,
+    text: `Research target: "${question}"`,
     type: 'ai_interpretation',
-    source: 'RecallGuard Synthesis Core'
+    source: 'RecallGuard Epistemic Synthesizer'
   })
 
   if (matchedMemories.length > 0) {
     claims.push({
       id: `CLM-${Date.now().toString().slice(-3)}B`,
-      text: `Context verified against recalled memory ${matchedMemories[0].id}: ${matchedMemories[0].title}`,
+      text: `Cross-referenced against stored memory ${matchedMemories[0].id} (${matchedMemories[0].title}).`,
       type: 'verified_fact',
-      source: `Persistent Memory (${matchedMemories[0].id})`,
+      source: `Persistent Memory [${matchedMemories[0].id}]`,
       verifiedAt: new Date().toISOString()
     })
   } else {
     claims.push({
       id: `CLM-${Date.now().toString().slice(-3)}C`,
-      text: 'No prior identical memory found in Walrus index; initializing novel epistemic hypothesis.',
+      text: 'No prior matching memory vector found; initializing fresh research baseline.',
       type: 'unverified_claim',
-      source: 'Exploratory Query'
+      source: 'Exploratory Inquiry'
     })
   }
 
   const newSession = {
-    id: `SES-0${sessions.length + 10}`,
+    id: `SES-LIVE-${Date.now().toString().slice(-6)}`,
+    provenance: 'live_production',
     question,
     status: 'completed',
     createdAt: new Date().toISOString(),
-    confidence: verifiedFactClaim ? 0.95 : 0.72,
+    confidence: verifiedFactClaim ? 0.96 : (matchedMemories.length > 0 ? 0.85 : 0.70),
     recalledMemoryIds,
     claims,
     conclusion: verifiedFactClaim
-      ? `Successfully anchored inquiry to live Sui Checkpoint #${verifiedFactClaim.details.checkpointSequence}. Synthesized findings with ${recalledMemoryIds.length} recalled Walrus memories.`
-      : `Synthesized inquiry using local memory index. Note: Tatum Sui RPC live verification requires TATUM_API_KEY in environment.`,
+      ? `Anchored inquiry to confirmed on-chain Sui Checkpoint #${verifiedFactClaim.details.checkpointSequence}. Synthesized with ${recalledMemoryIds.length} recalled memories.`
+      : `Synthesized inquiry using local memory index. Live on-chain anchoring: ${onChainError}.`,
     learningDelta: recalledMemoryIds.length > 0
-      ? `Correlated new finding with existing knowledge vectors (${recalledMemoryIds.join(', ')}). Stored in session graph.`
-      : 'Created fresh observation vector ready for Walrus persistent storage.'
+      ? `Recalled knowledge vectors (${recalledMemoryIds.join(', ')}). Reinforcing stance consistency.`
+      : 'Initialized novel observation ready for Walrus storage.'
   }
 
   sessions.unshift(newSession)
 
-  // Auto-generate memory candidate
-  const newMemory = {
-    id: `MEM-0${memories.length + 10}`,
-    category: verifiedFactClaim ? 'on_chain_fact' : 'epistemic_stance',
-    title: `Research Session Observation: ${question.slice(0, 40)}...`,
-    content: newSession.conclusion,
-    sourceReference: verifiedFactClaim ? 'Tatum Sui RPC + RecallGuard' : 'RecallGuard Agent Reasoning',
-    walrusBlobId: `walrus://blob/temp-${Date.now().toString().slice(-6)}`,
-    createdAt: new Date().toISOString(),
-    status: 'active',
-    reliabilityScore: verifiedFactClaim ? 0.96 : 0.82
+  // 3. Store new session finding into Walrus Memory service
+  let walrusStoreResult = null
+  let walrusStoreError = null
+  let storedMemory = null
+
+  try {
+    const memoryPayload = JSON.stringify({
+      sessionId: newSession.id,
+      question,
+      conclusion: newSession.conclusion,
+      timestamp: newSession.createdAt,
+      verifiedCheckpoint: onChainSuiData
+    })
+
+    const pubRes = await fetch(`${DEFAULT_WALRUS_PUBLISHER}/v1/blobs?epochs=1`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: memoryPayload,
+      signal: AbortSignal.timeout(18000)
+    })
+
+    if (pubRes.ok) {
+      const pubData = await pubRes.json()
+      const blobId = pubData.newlyCreated?.blobObject?.blobId || pubData.alreadyCertified?.blobId
+      const suiObjectId = pubData.newlyCreated?.blobObject?.id || null
+
+      walrusStoreResult = {
+        blobId,
+        suiObjectId,
+        aggregatorUrl: `${DEFAULT_WALRUS_AGGREGATOR}/v1/blobs/${blobId}`,
+        cost: pubData.newlyCreated?.cost || null,
+        certifiedEpoch: pubData.newlyCreated?.blobObject?.registeredEpoch || null
+      }
+
+      storedMemory = {
+        id: `MEM-LIVE-${Date.now().toString().slice(-6)}`,
+        provenance: 'live_production',
+        category: verifiedFactClaim ? 'on_chain_fact' : 'epistemic_stance',
+        title: `Observation: ${question.slice(0, 45)}...`,
+        content: newSession.conclusion,
+        sourceReference: verifiedFactClaim ? 'Tatum Sui RPC + Walrus Memory' : 'RecallGuard Memory Engine',
+        walrusBlobId: blobId,
+        walrusSuiObjectId: suiObjectId,
+        walrusAggregatorUrl: walrusStoreResult.aggregatorUrl,
+        createdAt: new Date().toISOString(),
+        status: 'active',
+        reliabilityScore: verifiedFactClaim ? 0.98 : 0.85,
+        storageVerified: true
+      }
+      memories.unshift(storedMemory)
+    } else {
+      walrusStoreError = `Walrus publisher returned HTTP ${pubRes.status}`
+    }
+  } catch (err) {
+    walrusStoreError = `Walrus publisher communication failed: ${err.message}`
   }
-  memories.unshift(newMemory)
 
   res.status(201).json({
     session: newSession,
-    storedMemory: newMemory,
+    storedMemory,
+    walrusStoreResult,
+    walrusStoreError,
     onChainSuiData,
     onChainError
   })
 })
 
-// 5. Memory Explorer Endpoints
+// --------------------------------------------------------------------------
+// 4. Memory Explorer Endpoints (Walrus Store & Retrieve)
+// --------------------------------------------------------------------------
 router.get('/memories', (req, res) => {
-  const { category, search } = req.query
+  const { category, search, provenance } = req.query
   let list = [...memories]
+  if (provenance && provenance !== 'all') {
+    list = list.filter(m => m.provenance === provenance)
+  }
   if (category && category !== 'all') {
     list = list.filter(m => m.category === category)
   }
@@ -408,42 +533,130 @@ router.get('/memories', (req, res) => {
   res.json(list)
 })
 
-router.post('/memories', (req, res) => {
-  const { title, content, category, sourceReference } = req.body
+// Real Walrus Memory Storage: calls official Walrus Publisher HTTP PUT
+router.post('/memories', async (req, res) => {
+  const { title, content, category = 'epistemic_stance', sourceReference = 'Manual Input' } = req.body
   if (!title || !content) {
     return res.status(400).json({ error: 'Title and content are required' })
   }
 
-  const newMem = {
-    id: `MEM-0${memories.length + 10}`,
-    category: category || 'epistemic_stance',
+  const memoryPayload = JSON.stringify({
     title,
     content,
-    sourceReference: sourceReference || 'Manual Entry / Agent Annotation',
-    walrusBlobId: `walrus://blob/manual-${Date.now().toString().slice(-6)}`,
-    createdAt: new Date().toISOString(),
-    status: 'active',
-    reliabilityScore: 0.90
+    category,
+    sourceReference,
+    createdAt: new Date().toISOString()
+  })
+
+  try {
+    const pubRes = await fetch(`${DEFAULT_WALRUS_PUBLISHER}/v1/blobs?epochs=1`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: memoryPayload,
+      signal: AbortSignal.timeout(18000)
+    })
+
+    if (!pubRes.ok) {
+      const errText = await pubRes.text()
+      return res.status(pubRes.status).json({
+        error: `Walrus storage rejected operation (HTTP ${pubRes.status})`,
+        details: errText
+      })
+    }
+
+    const pubData = await pubRes.json()
+    const blobId = pubData.newlyCreated?.blobObject?.blobId || pubData.alreadyCertified?.blobId
+    const suiObjectId = pubData.newlyCreated?.blobObject?.id || null
+
+    const newMemory = {
+      id: `MEM-LIVE-${Date.now().toString().slice(-6)}`,
+      provenance: 'live_production',
+      category,
+      title,
+      content,
+      sourceReference,
+      walrusBlobId: blobId,
+      walrusSuiObjectId: suiObjectId,
+      walrusAggregatorUrl: `${DEFAULT_WALRUS_AGGREGATOR}/v1/blobs/${blobId}`,
+      createdAt: new Date().toISOString(),
+      status: 'active',
+      reliabilityScore: 0.95,
+      storageVerified: true
+    }
+
+    memories.unshift(newMemory)
+    res.status(201).json({
+      success: true,
+      memory: newMemory,
+      walrusRawResponse: pubData
+    })
+  } catch (err) {
+    res.status(502).json({
+      error: 'Failed to write memory blob to Walrus storage',
+      details: err.message
+    })
   }
-  memories.unshift(newMem)
-  res.status(201).json(newMem)
 })
 
-// 6. Tatum Sui Direct RPC Query Verification endpoint (Read-Only)
+// Real Walrus Memory Recall / Fetch from Aggregator
+router.get('/memories/walrus/:blobId', async (req, res) => {
+  const { blobId } = req.params
+  if (!blobId || blobId.startsWith('demo_')) {
+    return res.status(400).json({ error: 'Cannot recall demo seed blob from real Walrus nodes.' })
+  }
+
+  try {
+    const aggRes = await fetch(`${DEFAULT_WALRUS_AGGREGATOR}/v1/blobs/${blobId}`, {
+      signal: AbortSignal.timeout(8000)
+    })
+    if (!aggRes.ok) {
+      return res.status(aggRes.status).json({
+        error: `Walrus aggregator returned HTTP ${aggRes.status}`
+      })
+    }
+
+    const contentType = aggRes.headers.get('content-type') || 'text/plain'
+    const rawData = await aggRes.text()
+
+    let parsed = null
+    try {
+      parsed = JSON.parse(rawData)
+    } catch (_e) {
+      parsed = rawData
+    }
+
+    res.json({
+      blobId,
+      status: 'retrieved_from_walrus',
+      aggregatorUrl: `${DEFAULT_WALRUS_AGGREGATOR}/v1/blobs/${blobId}`,
+      contentType,
+      data: parsed
+    })
+  } catch (err) {
+    res.status(502).json({
+      error: 'Failed to retrieve blob from Walrus aggregator',
+      details: err.message
+    })
+  }
+})
+
+// --------------------------------------------------------------------------
+// 5. Tatum Sui Direct RPC Query Verification endpoint (Read-Only)
+// --------------------------------------------------------------------------
 router.post('/sui/rpc', async (req, res) => {
   const { method = 'sui_getLatestCheckpointSequenceNumber', params = [], network = 'mainnet' } = req.body
 
-  // Guard against non-read-only RPC methods
+  // Strict guard: read-only only
   const disallowedPrefixes = ['unsafe_', 'sui_executeTransactionBlock', 'sui_dryRunTransactionBlock']
   if (disallowedPrefixes.some(prefix => method.startsWith(prefix))) {
     return res.status(403).json({
-      error: 'RecallGuard enforces read-only verification. Transaction submission and private key signing methods are disallowed.'
+      error: 'RecallGuard enforces read-only verification. Transaction signing or mutative RPCs are prohibited.'
     })
   }
 
   if (!process.env.TATUM_API_KEY) {
     return res.status(503).json({
-      error: 'TATUM_API_KEY is not configured on the server. Please add your Tatum API key to workspace secrets to execute live Sui queries.'
+      error: 'TATUM_API_KEY is not configured in workspace environment. Set TATUM_API_KEY to send live Sui queries.'
     })
   }
 
@@ -462,6 +675,8 @@ router.post('/sui/rpc', async (req, res) => {
       params,
       timestamp: new Date().toISOString(),
       provider: 'Tatum Managed Sui RPC Gateway',
+      gatewayUrl: tatumGatewayUrl('sui', network),
+      httpStatus: response.status,
       response: data
     })
   } catch (err) {
@@ -472,7 +687,9 @@ router.post('/sui/rpc', async (req, res) => {
   }
 })
 
-// 7. Learning Decisions & Audit Timeline
+// --------------------------------------------------------------------------
+// 6. Learning Decisions & Audit Timeline
+// --------------------------------------------------------------------------
 router.get('/decisions', (_req, res) => {
   res.json(decisions)
 })
@@ -480,13 +697,13 @@ router.get('/decisions', (_req, res) => {
 router.get('/timeline', (_req, res) => {
   const timelineEvents = []
 
-  // Add sessions
   sessions.forEach(s => {
     timelineEvents.push({
-      id: `TL-SES-${s.id}`,
+      id: `TL-${s.id}`,
       type: 'session',
+      provenance: s.provenance,
       timestamp: s.createdAt,
-      title: `Research Session: ${s.id}`,
+      title: `${s.provenance === 'demo_seed' ? '[DEMO] ' : ''}Research Session: ${s.id}`,
       subtitle: s.question,
       confidence: s.confidence,
       details: s.conclusion,
@@ -494,63 +711,70 @@ router.get('/timeline', (_req, res) => {
     })
   })
 
-  // Add decisions / hypothesis updates
   decisions.forEach(d => {
     timelineEvents.push({
-      id: `TL-DEC-${d.id}`,
+      id: `TL-${d.id}`,
       type: 'decision_update',
+      provenance: d.provenance,
       timestamp: d.timestamp,
-      title: `Epistemic Belief Revision: ${d.topic}`,
+      title: `${d.provenance === 'demo_seed' ? '[DEMO] ' : ''}Epistemic Revision: ${d.topic}`,
       subtitle: d.changeReason,
       confidence: 0.98,
-      details: `Changed from: "${d.priorClaim}" -> "${d.newClaim}"`,
+      details: `Changed: "${d.priorClaim}" -> "${d.newClaim}"`,
       recalledMemoryIds: []
     })
   })
 
-  // Sort chronologically descending
   timelineEvents.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
   res.json(timelineEvents)
 })
 
-// 8. Walrus memwal SDK Integration Status & Python Code Generator
+// --------------------------------------------------------------------------
+// 7. Official Walrus memwal SDK Specification
+// --------------------------------------------------------------------------
 router.get('/walrus/sdk-spec', (_req, res) => {
   res.json({
     sdk: 'memwal',
     version: '0.2.1',
-    pythonRequirements: ['memwal>=0.2.0', 'walrus-client>=0.1.0'],
+    storageEngine: 'Walrus RedStuff 2D Reed-Solomon',
+    endpoints: {
+      publisher: DEFAULT_WALRUS_PUBLISHER,
+      aggregator: DEFAULT_WALRUS_AGGREGATOR,
+      tatumSuiGateway: 'https://sui-mainnet.gateway.tatum.io'
+    },
     envRequirements: [
-      { name: 'WALRUS_API_KEY', description: 'API Key or publisher token for Walrus storage node' },
-      { name: 'WALRUS_STORAGE_URL', description: 'Walrus Aggregator / Publisher URL (e.g. https://aggregator.walrus-mainnet.walrus.space)' },
-      { name: 'SUI_RPC_URL', description: 'Tatum Sui Gateway URL for on-chain anchoring' }
+      { name: 'TATUM_API_KEY', description: 'Tatum API Key for authenticating Sui RPC gateway requests' },
+      { name: 'WALRUS_PUBLISHER_URL', description: 'HTTP endpoint for storing blobs (default: https://publisher.walrus-testnet.walrus.space)' },
+      { name: 'WALRUS_AGGREGATOR_URL', description: 'HTTP endpoint for retrieving blobs (default: https://aggregator.walrus-testnet.walrus.space)' }
     ],
-    samplePythonUsage: `import asyncio
+    officialPythonExample: `# Official memwal Python SDK integration pattern
+import asyncio
 from memwal import WalrusMemoryAgent
 
-async def run_recall_guard():
-    # Initialize persistent memory agent with Walrus backend
+async def main():
+    # Initialize agent with official Walrus endpoints
     agent = WalrusMemoryAgent(
         app_name="RecallGuard",
-        storage_url="https://aggregator.walrus-mainnet.walrus.space",
-        redundancy_codec="RedStuff-2D"
+        publisher_url="https://publisher.walrus-testnet.walrus.space",
+        aggregator_url="https://aggregator.walrus-testnet.walrus.space",
+        epochs=1
     )
     
-    # Store verified research claim
-    blob_ref = await agent.store_memory(
+    # Store verifiable memory blob
+    ref = await agent.store(
         category="on_chain_fact",
         title="Sui Checkpoint Verification",
-        content="Finalized checkpoint #82491204 verified via Tatum RPC Gateway",
-        metadata={"network": "sui-mainnet", "verified_by": "Tatum"}
+        content="Finalized checkpoint verified via Tatum Sui Gateway",
+        metadata={"network": "sui-mainnet", "provider": "Tatum"}
     )
-    print("Stored memory blob on Walrus:", blob_ref.blob_id)
-    
-    # Semantic recall against prior sessions
-    results = await agent.recall("Sui validator committee size", top_k=3)
-    for memory in results:
-        print(f"[{memory.id}] (Score: {memory.similarity}): {memory.title}")
+    print("Stored blob on Walrus:", ref.blob_id)
+
+    # Retrieve memory blob by ID
+    memory = await agent.recall(ref.blob_id)
+    print("Retrieved memory:", memory.content)
 
 if __name__ == "__main__":
-    asyncio.run(run_recall_guard())`
+    asyncio.run(main())`
   })
 })
 

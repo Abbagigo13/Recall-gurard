@@ -27,18 +27,32 @@ import {
   RotateCcw,
   Sparkles,
   Info,
-  Check
+  Check,
+  Server,
+  Cloud
 } from 'lucide-react';
 
-interface MetricData {
-  totalSessions: number;
-  totalMemories: number;
+interface MetricBreakdown {
+  sessionsCount: number;
+  memoriesCount: number;
+  decisionsCount: number;
   evaluatedClaims: number;
   verifiedFacts: number;
   supersededClaims: number;
-  accuracyScore: number;
-  activeLearnedDecisions: number;
-  meanReliabilityIndex: number;
+  accuracyScore: number | null;
+}
+
+interface MetricsResponse {
+  real: MetricBreakdown;
+  aggregated: {
+    totalSessions: number;
+    totalMemories: number;
+    evaluatedClaims: number;
+    verifiedFacts: number;
+    supersededClaims: number;
+    accuracyScore: number | null;
+    decisionsCount: number;
+  };
 }
 
 interface Claim {
@@ -52,6 +66,7 @@ interface Claim {
 
 interface ResearchSession {
   id: string;
+  provenance: 'live_production' | 'demo_seed';
   question: string;
   status: string;
   createdAt: string;
@@ -64,19 +79,24 @@ interface ResearchSession {
 
 interface MemoryItem {
   id: string;
+  provenance: 'live_production' | 'demo_seed';
   category: string;
   title: string;
   content: string;
   sourceReference: string;
   walrusBlobId: string;
+  walrusSuiObjectId?: string;
+  walrusAggregatorUrl?: string;
   createdAt: string;
   status: string;
   supersededBy?: string;
   reliabilityScore: number;
+  storageVerified: boolean;
 }
 
 interface DecisionItem {
   id: string;
+  provenance: 'live_production' | 'demo_seed';
   topic: string;
   previousSessionId: string;
   currentSessionId: string;
@@ -90,6 +110,7 @@ interface DecisionItem {
 interface TimelineItem {
   id: string;
   type: 'session' | 'decision_update';
+  provenance: 'live_production' | 'demo_seed';
   timestamp: string;
   title: string;
   subtitle: string;
@@ -98,26 +119,48 @@ interface TimelineItem {
   recalledMemoryIds: string[];
 }
 
-interface ConfigStatus {
-  hasTatumKey: boolean;
-  hasWalrusSdk: boolean;
-  tatumRpcStatus: string;
-  tatumRpcError: string | null;
-  suiLatestCheckpoint: string | null;
-  memwalAdapter: {
-    pythonSdkPackage: string;
-    version: string;
-    mode: string;
-    storageEngine: string;
+interface HealthData {
+  status: string;
+  timestamp: string;
+  integrations: {
+    tatumSuiRpc: {
+      configured: boolean;
+      status: string;
+      latencyMs: number | null;
+      details: any;
+      gatewayHost: string;
+    };
+    walrusMemory: {
+      configured: boolean;
+      publisherUrl: string;
+      publisherStatus: string;
+      publisherLatencyMs: number | null;
+      aggregatorUrl: string;
+      aggregatorStatus: string;
+      aggregatorLatencyMs: number | null;
+      pythonPackage: string;
+      encoding: string;
+    };
+  };
+  counts: {
+    totalSessions: number;
+    realSessions: number;
+    demoSessions: number;
+    totalMemories: number;
+    realMemories: number;
+    demoMemories: number;
   };
 }
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'workspace' | 'memories' | 'verification' | 'learning' | 'timeline' | 'sdk'>('dashboard');
   
+  // Provenance filter: 'all' | 'live_production' | 'demo_seed'
+  const [provenanceFilter, setProvenanceFilter] = useState<'all' | 'live_production' | 'demo_seed'>('all');
+
   // Telemetry state
-  const [metrics, setMetrics] = useState<MetricData | null>(null);
-  const [config, setConfig] = useState<ConfigStatus | null>(null);
+  const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
+  const [health, setHealth] = useState<HealthData | null>(null);
   const [sessions, setSessions] = useState<ResearchSession[]>([]);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [decisions, setDecisions] = useState<DecisionItem[]>([]);
@@ -128,6 +171,7 @@ export default function App() {
   // Workspace form state
   const [researchQuery, setResearchQuery] = useState('');
   const [isExecuting, setIsExecuting] = useState(false);
+  const [researchResultData, setResearchResultData] = useState<any>(null);
   const [researchNotice, setResearchNotice] = useState<string | null>(null);
 
   // Memory filter states
@@ -140,6 +184,13 @@ export default function App() {
   const [newMemContent, setNewMemContent] = useState('');
   const [newMemCategory, setNewMemCategory] = useState('on_chain_fact');
   const [newMemSource, setNewMemSource] = useState('Tatum Sui Gateway Verification');
+  const [memoryStoreLoading, setMemoryStoreLoading] = useState(false);
+  const [memoryStoreStatusMsg, setMemoryStoreStatusMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // Recall by blob ID
+  const [inspectBlobId, setInspectBlobId] = useState<string | null>(null);
+  const [inspectBlobLoading, setInspectBlobLoading] = useState(false);
+  const [inspectBlobData, setInspectBlobData] = useState<any>(null);
 
   // RPC Console state
   const [rpcMethod, setRpcMethod] = useState('sui_getLatestCheckpointSequenceNumber');
@@ -149,18 +200,18 @@ export default function App() {
   const [rpcResult, setRpcResult] = useState<any>(null);
   const [rpcError, setRpcError] = useState<string | null>(null);
 
-  // Load telemetry
+  // Load telemetry & health status
   const loadTelemetry = async () => {
     try {
-      const [cfgRes, metRes, sesRes, memRes, decRes, tlRes] = await Promise.all([
-        fetch('/api/recallguard/config-status').then(r => r.json()),
+      const [hlthRes, metRes, sesRes, memRes, decRes, tlRes] = await Promise.all([
+        fetch('/api/recallguard/health').then(r => r.json()),
         fetch('/api/recallguard/metrics').then(r => r.json()),
         fetch('/api/recallguard/sessions').then(r => r.json()),
         fetch('/api/recallguard/memories').then(r => r.json()),
         fetch('/api/recallguard/decisions').then(r => r.json()),
         fetch('/api/recallguard/timeline').then(r => r.json())
       ]);
-      setConfig(cfgRes);
+      setHealth(hlthRes);
       setMetrics(metRes);
       setSessions(sesRes);
       setMemories(memRes);
@@ -189,6 +240,7 @@ export default function App() {
 
     setIsExecuting(true);
     setResearchNotice(null);
+    setResearchResultData(null);
 
     try {
       const res = await fetch('/api/recallguard/sessions', {
@@ -200,11 +252,20 @@ export default function App() {
       if (res.ok) {
         setSessions(prev => [data.session, ...prev]);
         setSelectedSession(data.session);
-        setMemories(prev => [data.storedMemory, ...prev]);
-        setResearchNotice('Research session synthesized and recorded into Walrus memory index.');
+        if (data.storedMemory) {
+          setMemories(prev => [data.storedMemory, ...prev]);
+        }
+        setResearchResultData(data);
+        if (data.walrusStoreResult?.blobId) {
+          setResearchNotice(`Live session anchored to Walrus blob: ${data.walrusStoreResult.blobId}`);
+        } else if (data.walrusStoreError) {
+          setResearchNotice(`Session recorded in-memory. Walrus write status: ${data.walrusStoreError}`);
+        }
         setResearchQuery('');
+        // Refresh metrics & health
         fetch('/api/recallguard/metrics').then(r => r.json()).then(setMetrics);
         fetch('/api/recallguard/timeline').then(r => r.json()).then(setTimeline);
+        fetch('/api/recallguard/health').then(r => r.json()).then(setHealth);
       } else {
         setResearchNotice(data.error || 'Failed to complete research session.');
       }
@@ -215,10 +276,13 @@ export default function App() {
     }
   };
 
-  // Handle manual memory commit
+  // Handle real Walrus memory commit
   const handleCreateMemory = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newMemTitle.trim() || !newMemContent.trim()) return;
+
+    setMemoryStoreLoading(true);
+    setMemoryStoreStatusMsg(null);
 
     try {
       const res = await fetch('/api/recallguard/memories', {
@@ -231,16 +295,47 @@ export default function App() {
           sourceReference: newMemSource.trim()
         })
       });
-      if (res.ok) {
-        const created = await res.json();
-        setMemories(prev => [created, ...prev]);
-        setShowAddMemory(false);
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setMemories(prev => [data.memory, ...prev]);
+        setMemoryStoreStatusMsg({
+          type: 'success',
+          text: `Memory confirmed written to Walrus storage (Blob: ${data.memory.walrusBlobId})`
+        });
         setNewMemTitle('');
         setNewMemContent('');
         fetch('/api/recallguard/metrics').then(r => r.json()).then(setMetrics);
+        fetch('/api/recallguard/health').then(r => r.json()).then(setHealth);
+      } else {
+        setMemoryStoreStatusMsg({
+          type: 'error',
+          text: data.error || data.details || 'Walrus rejected memory write request.'
+        });
       }
-    } catch (err) {
-      console.error('Failed to create memory:', err);
+    } catch (err: any) {
+      setMemoryStoreStatusMsg({
+        type: 'error',
+        text: `Network failure connecting to Walrus publisher: ${err.message}`
+      });
+    } finally {
+      setMemoryStoreLoading(false);
+    }
+  };
+
+  // Inspect real Walrus blob content from aggregator
+  const handleInspectWalrusBlob = async (blobId: string) => {
+    setInspectBlobId(blobId);
+    setInspectBlobLoading(true);
+    setInspectBlobData(null);
+
+    try {
+      const res = await fetch(`/api/recallguard/memories/walrus/${encodeURIComponent(blobId)}`);
+      const data = await res.json();
+      setInspectBlobData(data);
+    } catch (err: any) {
+      setInspectBlobData({ error: err.message });
+    } finally {
+      setInspectBlobLoading(false);
     }
   };
 
@@ -282,54 +377,75 @@ export default function App() {
     }
   };
 
+  const filteredSessions = sessions.filter(s => {
+    return provenanceFilter === 'all' || s.provenance === provenanceFilter;
+  });
+
   const filteredMemories = memories.filter(m => {
+    const matchesProvenance = provenanceFilter === 'all' || m.provenance === provenanceFilter;
     const matchesCategory = memoryCategory === 'all' || m.category === memoryCategory;
     const matchesSearch = !memorySearch ||
       m.title.toLowerCase().includes(memorySearch.toLowerCase()) ||
       m.content.toLowerCase().includes(memorySearch.toLowerCase()) ||
       m.id.toLowerCase().includes(memorySearch.toLowerCase());
-    return matchesCategory && matchesSearch;
+    return matchesProvenance && matchesCategory && matchesSearch;
+  });
+
+  const filteredTimeline = timeline.filter(t => {
+    return provenanceFilter === 'all' || t.provenance === provenanceFilter;
   });
 
   return (
     <div className="min-h-screen bg-primary text-primary font-sans flex flex-col">
-      {/* App Header */}
+      {/* Top Header */}
       <header className="border-b border-secondary bg-primary px-xl py-md sticky top-0 z-50">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-md">
-            {/* Featured Icon component recipe */}
             <span className="flex size-10 items-center justify-center rounded-full bg-secondary">
               <Shield className="size-5 shrink-0 text-fg-secondary" aria-hidden="true" />
             </span>
             <div>
               <div className="flex items-center gap-sm">
                 <span className="text-heading-xs font-semibold text-primary tracking-tight">RecallGuard</span>
-                {/* Badge component recipe */}
                 <span className="inline-flex items-center gap-xs rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
-                  Tatum × Walrus
+                  Tatum × Walrus Hackathon
                 </span>
               </div>
-              <p className="text-xs text-tertiary">Autonomous AI Research Agent with Verifiable Memory</p>
+              <p className="text-xs text-tertiary">Autonomous AI Research Agent with Persistent Memory & Verifiable Sui Data</p>
             </div>
           </div>
 
-          {/* System status badges */}
+          {/* Integration Live Status Badges */}
           <div className="flex items-center gap-sm">
-            {/* Badge component recipe */}
-            <span className="inline-flex items-center gap-xs rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
-              <span className="size-2 rounded-full bg-brand-solid animate-pulse" />
-              memwal active
+            {/* Walrus Integration status badge */}
+            <span className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium ${
+              health?.integrations.walrusMemory.publisherStatus === 'operational'
+                ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
+                : 'border-utility-warning-200 bg-utility-warning-50 text-utility-warning-700'
+            }`}>
+              <span className={`size-2 rounded-full ${
+                health?.integrations.walrusMemory.publisherStatus === 'operational' ? 'bg-success-primary' : 'bg-warning-primary'
+              }`} />
+              Walrus: {health?.integrations.walrusMemory.publisherStatus || 'checking'}
             </span>
-            <span className="inline-flex items-center gap-xs rounded-full border border-utility-success-200 bg-utility-success-50 px-md py-xxs text-xs font-medium text-utility-success-700">
-              <span className="size-2 rounded-full bg-success-primary" />
-              Tatum Sui RPC
+
+            {/* Tatum Sui RPC status badge */}
+            <span className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium ${
+              health?.integrations.tatumSuiRpc.status === 'connected'
+                ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
+                : 'border-utility-gray-200 bg-utility-gray-50 text-utility-gray-700'
+            }`}>
+              <span className={`size-2 rounded-full ${
+                health?.integrations.tatumSuiRpc.status === 'connected' ? 'bg-success-primary' : 'bg-utility-gray-500'
+              }`} />
+              Tatum Sui: {health?.integrations.tatumSuiRpc.status || 'configured'}
             </span>
           </div>
         </div>
 
-        {/* Tab strip following guidelines/components/tabs.md */}
-        <div className="max-w-7xl mx-auto mt-md">
-          <div className="flex gap-lg border-b border-secondary">
+        {/* Tab navigation strip */}
+        <div className="max-w-7xl mx-auto mt-md flex items-center justify-between border-b border-secondary">
+          <div className="flex gap-lg">
             {[
               { id: 'dashboard', label: 'Dashboard' },
               { id: 'workspace', label: 'Research Workspace' },
@@ -352,10 +468,24 @@ export default function App() {
               </button>
             ))}
           </div>
+
+          {/* Global Data Provenance Filter */}
+          <div className="flex items-center gap-xs pb-xxs text-xs">
+            <span className="text-quaternary font-medium">Data View:</span>
+            <select
+              value={provenanceFilter}
+              onChange={e => setProvenanceFilter(e.target.value as any)}
+              className="rounded-md bg-primary px-sm py-xxs text-xs text-primary border border-primary focus-visible:ring-2 focus-visible:ring-focus-ring"
+            >
+              <option value="all">All (Real + Labeled Demo)</option>
+              <option value="live_production">Live Confirmed Only</option>
+              <option value="demo_seed">Demo Historical Seeds</option>
+            </select>
+          </div>
         </div>
       </header>
 
-      {/* Main Content Body */}
+      {/* Main Content Area */}
       <main className="flex-1 max-w-7xl mx-auto w-full p-xl space-y-xl">
         {/* TAB 1: DASHBOARD */}
         {activeTab === 'dashboard' && (
@@ -367,7 +497,6 @@ export default function App() {
                   Persistent multi-session memory tracking, verifiable Sui data, and transparent claim validation.
                 </p>
               </div>
-              {/* Primary button component recipe */}
               <button
                 onClick={() => setActiveTab('workspace')}
                 className="inline-flex items-center gap-sm rounded-lg border border-transparent bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand shadow-xs hover:bg-brand-solid-hover focus-visible:ring-2 focus-visible:ring-focus-ring disabled:opacity-50"
@@ -377,7 +506,30 @@ export default function App() {
               </button>
             </div>
 
-            {/* Stat Cards - Card component recipe: rounded-xl border border-secondary bg-primary p-xl shadow-xs */}
+            {/* Backend Health Callout Bar */}
+            <div className="rounded-xl border border-secondary bg-primary p-lg shadow-xs flex items-center justify-between flex-wrap gap-md">
+              <div className="flex items-center gap-md">
+                <Server className="size-5 shrink-0 text-fg-brand-primary" />
+                <div className="text-xs">
+                  <span className="font-semibold text-primary block">Integration Health Status</span>
+                  <span className="text-tertiary">
+                    Walrus Publisher: <strong className="text-secondary">{health?.integrations.walrusMemory.publisherUrl}</strong> ({health?.integrations.walrusMemory.publisherStatus})
+                    &nbsp;•&nbsp;
+                    Walrus Aggregator: <strong className="text-secondary">{health?.integrations.walrusMemory.aggregatorUrl}</strong>
+                  </span>
+                </div>
+              </div>
+              <div className="flex items-center gap-xs">
+                <span className="inline-flex items-center gap-xs rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
+                  {health?.counts.realMemories ?? 0} Live Verified Memories
+                </span>
+                <span className="inline-flex items-center gap-xs rounded-full border border-utility-gray-200 bg-utility-gray-50 px-md py-xxs text-xs font-medium text-utility-gray-700">
+                  {health?.counts.demoMemories ?? 0} Labeled Demo Seeds
+                </span>
+              </div>
+            </div>
+
+            {/* Stat Cards */}
             <div className="grid grid-cols-1 md:grid-cols-4 gap-md">
               <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs">
                 <div className="flex items-center justify-between text-tertiary mb-xs">
@@ -385,11 +537,15 @@ export default function App() {
                   <Activity className="size-4 shrink-0 text-fg-quaternary" />
                 </div>
                 <p className="mt-md text-heading-xs font-semibold text-primary">
-                  {metrics?.totalSessions ?? 12}
+                  {provenanceFilter === 'live_production'
+                    ? (metrics?.real.sessionsCount ?? 0)
+                    : (metrics?.aggregated.totalSessions ?? 0)}
                 </p>
                 <div className="text-xs text-secondary mt-xs flex items-center gap-xs">
                   <TrendingUp className="size-3 shrink-0 text-fg-success-primary" />
-                  <span>Persistent audit trails recorded</span>
+                  <span>
+                    {metrics?.real.sessionsCount ?? 0} live executed, {metrics?.aggregated.totalSessions ?? 0} total
+                  </span>
                 </div>
               </section>
 
@@ -399,10 +555,12 @@ export default function App() {
                   <Database className="size-4 shrink-0 text-fg-quaternary" />
                 </div>
                 <p className="mt-md text-heading-xs font-semibold text-primary">
-                  {metrics?.totalMemories ?? 5}
+                  {provenanceFilter === 'live_production'
+                    ? (metrics?.real.memoriesCount ?? 0)
+                    : (metrics?.aggregated.totalMemories ?? 0)}
                 </p>
                 <p className="text-xs text-tertiary mt-xs">
-                  Walrus RedStuff 2D redundancy
+                  {metrics?.real.memoriesCount ?? 0} confirmed written to Walrus
                 </p>
               </section>
 
@@ -412,10 +570,14 @@ export default function App() {
                   <CheckCircle2 className="size-4 shrink-0 text-fg-quaternary" />
                 </div>
                 <p className="mt-md text-heading-xs font-semibold text-primary">
-                  {metrics?.evaluatedClaims ?? 10}
+                  {provenanceFilter === 'live_production'
+                    ? (metrics?.real.evaluatedClaims ?? 0)
+                    : (metrics?.aggregated.evaluatedClaims ?? 0)}
                 </p>
                 <p className="text-xs text-secondary mt-xs">
-                  {metrics?.verifiedFacts ?? 6} on-chain verified, {metrics?.supersededClaims ?? 1} superseded
+                  {provenanceFilter === 'live_production'
+                    ? `${metrics?.real.verifiedFacts ?? 0} verified on-chain`
+                    : `${metrics?.aggregated.verifiedFacts ?? 0} verified facts, ${metrics?.aggregated.supersededClaims ?? 0} superseded`}
                 </p>
               </section>
 
@@ -425,22 +587,26 @@ export default function App() {
                   <Award className="size-4 shrink-0 text-fg-brand-primary" />
                 </div>
                 <p className="mt-md text-heading-xs font-semibold text-primary">
-                  {metrics ? `${metrics.accuracyScore}%` : '92.3%'}
+                  {provenanceFilter === 'live_production'
+                    ? (metrics?.real.accuracyScore !== null ? `${metrics?.real.accuracyScore}%` : 'N/A (Pending Live Data)')
+                    : (metrics?.aggregated.accuracyScore !== null ? `${metrics?.aggregated.accuracyScore}%` : 'N/A')}
                 </p>
                 <p className="text-xs text-secondary mt-xs">
-                  Calculated from verified ground truths
+                  {metrics?.real.accuracyScore !== null
+                    ? 'Calculated from live evaluated outcomes'
+                    : 'Requires evaluated production outcomes'}
                 </p>
               </section>
             </div>
 
-            {/* Split layout: Recent Activity and Autonomous Learning Engine */}
+            {/* Split layout: Recent Sessions and Learning Engine */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-xl">
               {/* Recent Sessions */}
               <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs flex flex-col space-y-md">
                 <div className="flex items-center justify-between">
                   <div>
                     <h2 className="text-heading-xs font-semibold text-primary">Recent Research Sessions</h2>
-                    <p className="text-xs text-tertiary">Multi-session memory recall history</p>
+                    <p className="text-xs text-tertiary">Chronological history with memory recall tags</p>
                   </div>
                   <button
                     onClick={() => setActiveTab('timeline')}
@@ -451,7 +617,7 @@ export default function App() {
                 </div>
 
                 <div className="space-y-sm flex-1">
-                  {sessions.slice(0, 3).map(s => (
+                  {filteredSessions.slice(0, 3).map(s => (
                     <div
                       key={s.id}
                       onClick={() => {
@@ -461,12 +627,20 @@ export default function App() {
                       className="p-md rounded-md bg-secondary hover:bg-secondary-hover border border-secondary transition-colors cursor-pointer space-y-xs"
                     >
                       <div className="flex items-center justify-between text-xs text-tertiary">
-                        <span className="font-mono text-quaternary font-bold">{s.id}</span>
+                        <div className="flex items-center gap-xs">
+                          <span className="font-mono text-quaternary font-bold">{s.id}</span>
+                          <span className={`inline-flex items-center rounded-xs px-xs py-xxs font-mono text-xs uppercase ${
+                            s.provenance === 'live_production'
+                              ? 'bg-utility-brand-50 text-utility-brand-700 border border-utility-brand-200'
+                              : 'bg-utility-gray-50 text-utility-gray-700 border border-utility-gray-200'
+                          }`}>
+                            {s.provenance === 'live_production' ? 'Live' : 'Demo'}
+                          </span>
+                        </div>
                         <span>{new Date(s.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                       </div>
                       <h3 className="text-sm font-medium text-primary line-clamp-1">{s.question}</h3>
                       <div className="flex items-center gap-xs flex-wrap">
-                        {/* Badge component recipe */}
                         <span className="inline-flex items-center gap-xs rounded-full border border-utility-success-200 bg-utility-success-50 px-md py-xxs text-xs font-medium text-utility-success-700">
                           Confidence: {Math.round(s.confidence * 100)}%
                         </span>
@@ -478,6 +652,11 @@ export default function App() {
                       </div>
                     </div>
                   ))}
+                  {filteredSessions.length === 0 && (
+                    <div className="py-xl text-center text-sm text-tertiary">
+                      No sessions match the current provenance filter.
+                    </div>
+                  )}
                 </div>
               </section>
 
@@ -485,7 +664,7 @@ export default function App() {
               <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs flex flex-col space-y-md">
                 <div className="flex items-center justify-between">
                   <div>
-                    <h2 className="text-heading-xs font-semibold text-primary">Epistemic Stance & Learning</h2>
+                    <h2 className="text-heading-xs font-semibold text-primary">Autonomous Learning Engine</h2>
                     <p className="text-xs text-tertiary">Auditable adjustments when on-chain evidence arrives</p>
                   </div>
                   <button
@@ -499,15 +678,14 @@ export default function App() {
                 <div className="space-y-md">
                   <div className="p-md rounded-md bg-secondary border border-secondary space-y-xs">
                     <div className="flex items-center justify-between text-xs">
-                      <span className="font-semibold text-primary">Belief Convergence Index</span>
-                      <span className="text-sm font-mono text-tertiary">84%</span>
+                      <span className="font-semibold text-primary">Empirical Belief Revision Process</span>
+                      <span className="text-sm font-mono text-tertiary">Active</span>
                     </div>
-                    {/* Progress-bar component recipe: h-2 w-full overflow-hidden rounded-full bg-tertiary */}
                     <div className="h-2 w-full overflow-hidden rounded-full bg-tertiary">
-                      <div className="h-full w-[84%] rounded-full bg-brand-solid" />
+                      <div className="h-full w-[80%] rounded-full bg-brand-solid" />
                     </div>
                     <p className="text-xs text-tertiary mt-xs">
-                      Agent replaces superseded web assertions systematically when cryptographically verified Tatum Sui states contradict them.
+                      Agent revises conclusions systematically when on-chain Sui evidence contradicts earlier web claims.
                     </p>
                   </div>
 
@@ -519,18 +697,18 @@ export default function App() {
                       </span>
                     </div>
                     <p className="text-xs text-secondary leading-relaxed">
-                      "In Session #009, agent concluded Walrus testnet nodes required 5,000 SUI stake. In Session #011, fresh on-chain contract state retrieved through Tatum Sui RPC showed minimum threshold is 10,000 SUI. Prior claim was marked superseded."
+                      "In Session #009, agent concluded Walrus testnet nodes required 5,000 SUI stake. In Session #011, fresh on-chain contract state retrieved through Tatum Sui RPC showed minimum threshold is 10,000 SUI. Agent marked prior claim as superseded."
                     </p>
                   </div>
 
                   <div className="p-md rounded-md bg-secondary border border-secondary space-y-xs">
                     <span className="text-xs font-semibold text-primary">Walrus Persistent Storage Layer</span>
                     <div className="flex items-center justify-between text-xs text-secondary">
-                      <span>Adapter Spec:</span>
-                      <span className="font-mono text-tertiary">memwal v0.2.1</span>
+                      <span>Publisher Endpoint:</span>
+                      <span className="font-mono text-tertiary">{health?.integrations.walrusMemory.publisherUrl}</span>
                     </div>
                     <div className="flex items-center justify-between text-xs text-secondary">
-                      <span>Redundancy:</span>
+                      <span>Redundancy Codec:</span>
                       <span className="text-utility-success-700 font-medium">3f + 1 Reed-Solomon</span>
                     </div>
                   </div>
@@ -550,7 +728,7 @@ export default function App() {
               </p>
             </div>
 
-            {/* Input Inquiry Form - Input component recipe */}
+            {/* Input Inquiry Form */}
             <form onSubmit={handleExecuteResearch} className="rounded-xl border border-secondary bg-primary p-xl shadow-xs space-y-md">
               <div className="flex flex-col gap-sm">
                 <label className="text-sm font-medium text-secondary">Research Inquiry or Hypothesis</label>
@@ -559,10 +737,9 @@ export default function App() {
                     type="text"
                     value={researchQuery}
                     onChange={e => setResearchQuery(e.target.value)}
-                    placeholder="e.g. Verify Sui mainnet checkpoint progression and Walrus storage collateral rules"
+                    placeholder="e.g. Verify Sui latest checkpoint sequence number and Walrus testnet storage parameters"
                     className="flex-1 rounded-md bg-primary px-lg py-sm text-sm text-primary placeholder:text-placeholder border border-primary focus-visible:ring-2 focus-visible:ring-focus-ring"
                   />
-                  {/* Button component recipe */}
                   <button
                     type="submit"
                     disabled={isExecuting || !researchQuery.trim()}
@@ -571,7 +748,7 @@ export default function App() {
                     {isExecuting ? (
                       <>
                         <RefreshCw className="size-4 shrink-0 text-fg-white animate-spin" />
-                        <span>Synthesizing...</span>
+                        <span>Executing & Storing to Walrus...</span>
                       </>
                     ) : (
                       <>
@@ -581,10 +758,12 @@ export default function App() {
                     )}
                   </button>
                 </div>
-                <p className="text-xs text-tertiary">Cross-referenced against Walrus memory blobs and verified on Sui via Tatum RPC.</p>
+                <p className="text-xs text-tertiary">
+                  Attempts live write to Walrus publisher endpoint and runs read-only Tatum Sui RPC query if configured.
+                </p>
               </div>
 
-              {/* Presets */}
+              {/* Sample Presets */}
               <div className="flex items-center gap-xs text-xs text-tertiary flex-wrap">
                 <span className="font-semibold text-quaternary">Sample Inquiries:</span>
                 <button
@@ -610,13 +789,18 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Alert component recipe for notifications */}
+              {/* Research execution feedback alert */}
               {researchNotice && (
                 <div className="flex gap-lg rounded-xl bg-utility-brand-50 p-xl">
                   <Info className="mt-xxs size-5 shrink-0 text-utility-brand-600" aria-hidden="true" />
                   <div className="flex-1">
-                    <p className="text-sm font-semibold text-utility-brand-600">Session Recorded</p>
+                    <p className="text-sm font-semibold text-utility-brand-600">Research Operation Result</p>
                     <p className="mt-xxs text-sm text-tertiary">{researchNotice}</p>
+                    {researchResultData?.walrusStoreResult?.blobId && (
+                      <p className="mt-xs text-xs font-mono text-utility-brand-700">
+                        Walrus Blob URL: <a href={researchResultData.walrusStoreResult.aggregatorUrl} target="_blank" rel="noreferrer" className="underline">{researchResultData.walrusStoreResult.aggregatorUrl}</a>
+                      </p>
+                    )}
                   </div>
                   <button onClick={() => setResearchNotice(null)} className="text-xs text-utility-brand-600 font-bold">&times;</button>
                 </div>
@@ -633,6 +817,13 @@ export default function App() {
                       <div className="flex items-center gap-sm">
                         <span className="text-xs font-mono font-bold text-brand-primary">
                           {selectedSession?.id || 'Active Session'}
+                        </span>
+                        <span className={`inline-flex items-center rounded-xs px-xs py-xxs font-mono text-xs uppercase ${
+                          selectedSession?.provenance === 'live_production'
+                            ? 'bg-utility-brand-50 text-utility-brand-700 border border-utility-brand-200'
+                            : 'bg-utility-gray-50 text-utility-gray-700 border border-utility-gray-200'
+                        }`}>
+                          {selectedSession?.provenance === 'live_production' ? 'Live Confirmed' : 'Demo Seed'}
                         </span>
                         <h2 className="text-heading-xs font-semibold text-primary">
                           Epistemic Finding & Claim Breakdown
@@ -743,7 +934,7 @@ export default function App() {
                           <div key={memId} className="p-sm rounded-md bg-secondary border border-secondary text-xs space-y-xs">
                             <div className="flex items-center justify-between">
                               <span className="font-mono font-bold text-brand-primary">{memId}</span>
-                              <span className="text-quaternary">{mem?.status}</span>
+                              <span className="text-quaternary font-mono uppercase text-[10px]">{mem?.provenance}</span>
                             </div>
                             <p className="text-primary font-medium">{mem?.title || 'Memory Vector'}</p>
                             <p className="text-tertiary line-clamp-2">{mem?.content}</p>
@@ -757,7 +948,6 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Secondary button component recipe */}
                   <button
                     onClick={() => setActiveTab('memories')}
                     className="inline-flex w-full items-center justify-center gap-sm rounded-lg bg-primary px-lg py-sm text-sm font-semibold text-secondary border border-primary shadow-xs hover:bg-primary-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
@@ -766,11 +956,11 @@ export default function App() {
                   </button>
                 </section>
 
-                {/* Session List */}
+                {/* Session History List */}
                 <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs space-y-md">
                   <h3 className="text-sm font-semibold text-primary">Session History</h3>
                   <div className="space-y-xs max-h-60 overflow-y-auto">
-                    {sessions.map(s => (
+                    {filteredSessions.map(s => (
                       <button
                         key={s.id}
                         onClick={() => setSelectedSession(s)}
@@ -780,7 +970,7 @@ export default function App() {
                             : 'bg-secondary text-secondary hover:text-primary hover:bg-secondary-hover'
                         }`}
                       >
-                        <span className="truncate pr-xs">{s.id}: {s.question}</span>
+                        <span className="truncate pr-xs">[{s.provenance === 'live_production' ? 'LIVE' : 'DEMO'}] {s.id}: {s.question}</span>
                         <ChevronRight className="size-3 shrink-0" />
                       </button>
                     ))}
@@ -798,22 +988,25 @@ export default function App() {
               <div>
                 <h1 className="text-heading-md font-semibold text-primary">Persistent Memory Explorer</h1>
                 <p className="text-secondary text-sm">
-                  Decentralized memory records stored via the official Walrus Memory Python SDK (memwal).
+                  Decentralized memory records stored via the official Walrus Memory Python SDK (memwal) and HTTP protocol.
                 </p>
               </div>
-              {/* Primary button recipe */}
               <button
                 onClick={() => setShowAddMemory(!showAddMemory)}
                 className="inline-flex items-center gap-sm rounded-lg border border-transparent bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand shadow-xs hover:bg-brand-solid-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
               >
-                {showAddMemory ? 'Cancel Entry' : '+ Store New Memory'}
+                {showAddMemory ? 'Cancel Entry' : '+ Store New Memory to Walrus'}
               </button>
             </div>
 
-            {/* Modal/Form for adding memory */}
+            {/* Modal/Form for adding memory directly to Walrus */}
             {showAddMemory && (
               <form onSubmit={handleCreateMemory} className="rounded-xl border border-secondary bg-primary p-xl shadow-xs space-y-md">
-                <h3 className="text-sm font-semibold text-primary">Store Memory into Walrus Index</h3>
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-primary">Commit Memory to Real Walrus Storage</h3>
+                  <span className="text-xs text-tertiary">Publisher: {health?.integrations.walrusMemory.publisherUrl}</span>
+                </div>
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-md">
                   <div className="flex flex-col gap-sm">
                     <label className="text-sm font-medium text-secondary">Memory Title</label>
@@ -821,7 +1014,7 @@ export default function App() {
                       type="text"
                       value={newMemTitle}
                       onChange={e => setNewMemTitle(e.target.value)}
-                      placeholder="e.g. Sui Epoch Rolling Gas Cost Baseline"
+                      placeholder="e.g. Sui Checkpoint Finality Threshold"
                       className="rounded-md bg-primary px-lg py-sm text-sm text-primary placeholder:text-placeholder border border-primary focus-visible:ring-2 focus-visible:ring-focus-ring"
                     />
                   </div>
@@ -838,16 +1031,18 @@ export default function App() {
                     </select>
                   </div>
                 </div>
+
                 <div className="flex flex-col gap-sm">
                   <label className="text-sm font-medium text-secondary">Memory Content / Statement</label>
                   <textarea
                     rows={3}
                     value={newMemContent}
                     onChange={e => setNewMemContent(e.target.value)}
-                    placeholder="Provide verifiable memory content to be indexed across sessions..."
+                    placeholder="Provide verifiable memory content to be stored as a Walrus blob..."
                     className="rounded-md bg-primary px-lg py-sm text-sm text-primary placeholder:text-placeholder border border-primary focus-visible:ring-2 focus-visible:ring-focus-ring"
                   />
                 </div>
+
                 <div className="flex flex-col gap-sm">
                   <label className="text-sm font-medium text-secondary">Source Reference</label>
                   <input
@@ -857,6 +1052,15 @@ export default function App() {
                     className="rounded-md bg-primary px-lg py-sm text-sm text-primary font-mono border border-primary focus-visible:ring-2 focus-visible:ring-focus-ring"
                   />
                 </div>
+
+                {memoryStoreStatusMsg && (
+                  <div className={`flex gap-lg rounded-xl p-xl ${
+                    memoryStoreStatusMsg.type === 'success' ? 'bg-utility-success-50 text-utility-success-700' : 'bg-utility-error-50 text-utility-error-600'
+                  }`}>
+                    <div className="text-xs font-medium">{memoryStoreStatusMsg.text}</div>
+                  </div>
+                )}
+
                 <div className="flex justify-end gap-sm">
                   <button
                     type="button"
@@ -867,9 +1071,17 @@ export default function App() {
                   </button>
                   <button
                     type="submit"
-                    className="inline-flex items-center gap-sm rounded-lg border border-transparent bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand shadow-xs hover:bg-brand-solid-hover"
+                    disabled={memoryStoreLoading || !newMemTitle.trim() || !newMemContent.trim()}
+                    className="inline-flex items-center gap-sm rounded-lg border border-transparent bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand shadow-xs hover:bg-brand-solid-hover disabled:opacity-50"
                   >
-                    Commit Memory Vector
+                    {memoryStoreLoading ? (
+                      <>
+                        <RefreshCw className="size-4 shrink-0 text-fg-white animate-spin" />
+                        <span>Uploading to Walrus...</span>
+                      </>
+                    ) : (
+                      <span>Commit to Walrus</span>
+                    )}
                   </button>
                 </div>
               </form>
@@ -887,7 +1099,6 @@ export default function App() {
                   className="w-full pl-9 pr-md py-sm rounded-md bg-primary border border-primary text-primary placeholder:text-placeholder focus-visible:ring-2 focus-visible:ring-focus-ring text-sm"
                 />
               </div>
-              {/* Select component recipe */}
               <select
                 value={memoryCategory}
                 onChange={e => setMemoryCategory(e.target.value)}
@@ -900,17 +1111,17 @@ export default function App() {
               </select>
             </div>
 
-            {/* Table Component Recipe: overflow-hidden rounded-xl border border-secondary bg-primary */}
+            {/* Memory Table */}
             <div className="overflow-hidden rounded-xl border border-secondary bg-primary shadow-xs">
               <table className="w-full">
                 <thead className="sticky top-0 z-10 bg-secondary">
                   <tr className="border-b border-secondary text-left">
                     <th className="px-3xl py-md text-sm font-semibold text-quaternary">Memory ID</th>
-                    <th className="px-3xl py-md text-sm font-semibold text-quaternary">Category</th>
-                    <th className="px-3xl py-md text-sm font-semibold text-quaternary">Title & Claim</th>
+                    <th className="px-3xl py-md text-sm font-semibold text-quaternary">Provenance</th>
+                    <th className="px-3xl py-md text-sm font-semibold text-quaternary">Title & Content</th>
                     <th className="px-3xl py-md text-sm font-semibold text-quaternary">Source Reference</th>
                     <th className="px-3xl py-md text-sm font-semibold text-quaternary">Walrus Blob Reference</th>
-                    <th className="px-3xl py-md text-sm font-semibold text-quaternary">Reliability</th>
+                    <th className="px-3xl py-md text-sm font-semibold text-quaternary">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -920,14 +1131,12 @@ export default function App() {
                         {mem.id}
                       </td>
                       <td className="px-3xl py-xl text-md text-tertiary">
-                        <span className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium ${
-                          mem.status === 'superseded'
-                            ? 'border-utility-warning-200 bg-utility-warning-50 text-utility-warning-700 line-through'
-                            : mem.category === 'on_chain_fact'
-                            ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
-                            : 'border-utility-brand-200 bg-utility-brand-50 text-utility-brand-700'
+                        <span className={`inline-flex items-center rounded-xs px-xs py-xxs font-mono text-xs uppercase ${
+                          mem.provenance === 'live_production'
+                            ? 'bg-utility-brand-50 text-utility-brand-700 border border-utility-brand-200'
+                            : 'bg-utility-gray-50 text-utility-gray-700 border border-utility-gray-200'
                         }`}>
-                          {mem.status === 'superseded' ? 'Superseded' : mem.category.replace('_', ' ')}
+                          {mem.provenance === 'live_production' ? 'Live Walrus' : 'Demo Seed'}
                         </span>
                       </td>
                       <td className="px-3xl py-xl text-md text-tertiary max-w-sm">
@@ -947,20 +1156,70 @@ export default function App() {
                         {mem.sourceReference}
                       </td>
                       <td className="px-3xl py-xl text-md text-tertiary font-mono text-xs">
-                        <span className="truncate block max-w-[140px]" title={mem.walrusBlobId}>
-                          {mem.walrusBlobId}
-                        </span>
+                        {mem.provenance === 'live_production' ? (
+                          <a
+                            href={`${health?.integrations.walrusMemory.aggregatorUrl}/v1/blobs/${mem.walrusBlobId}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-brand-primary hover:underline truncate block max-w-[140px]"
+                            title={mem.walrusBlobId}
+                          >
+                            {mem.walrusBlobId}
+                          </a>
+                        ) : (
+                          <span className="text-quaternary truncate block max-w-[140px]" title={mem.walrusBlobId}>
+                            {mem.walrusBlobId}
+                          </span>
+                        )}
                       </td>
-                      <td className="px-3xl py-xl text-md text-tertiary font-mono">
-                        <span className={`${mem.reliabilityScore >= 0.9 ? 'text-utility-success-700' : 'text-utility-warning-700'} font-semibold`}>
-                          {Math.round(mem.reliabilityScore * 100)}%
-                        </span>
+                      <td className="px-3xl py-xl text-md text-tertiary">
+                        {mem.provenance === 'live_production' && (
+                          <button
+                            onClick={() => handleInspectWalrusBlob(mem.walrusBlobId)}
+                            className="text-xs text-brand-primary hover:underline font-semibold"
+                          >
+                            Recall from Walrus
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
+                  {filteredMemories.length === 0 && (
+                    <tr>
+                      <td colSpan={6} className="px-3xl py-xl text-center text-sm text-tertiary">
+                        No memories found matching the current filters.
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>
+
+            {/* Blob Inspection Drawer */}
+            {inspectBlobId && (
+              <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs space-y-md">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-sm">
+                    <Database className="size-4 shrink-0 text-fg-brand-primary" />
+                    <h3 className="text-sm font-semibold text-primary">
+                      Walrus Aggregator Direct Response for Blob <span className="font-mono text-brand-primary">{inspectBlobId}</span>
+                    </h3>
+                  </div>
+                  <button onClick={() => setInspectBlobId(null)} className="text-xs text-tertiary hover:text-primary font-bold">Close</button>
+                </div>
+
+                {inspectBlobLoading ? (
+                  <div className="p-xl text-center text-sm text-tertiary">
+                    <RefreshCw className="size-5 shrink-0 mx-auto mb-xs animate-spin text-fg-brand-primary" />
+                    Querying Walrus testnet aggregator node...
+                  </div>
+                ) : (
+                  <pre className="p-md rounded-md bg-secondary border border-secondary font-mono text-xs text-primary overflow-x-auto leading-relaxed">
+                    {JSON.stringify(inspectBlobData, null, 2)}
+                  </pre>
+                )}
+              </section>
+            )}
           </div>
         )}
 
@@ -974,7 +1233,7 @@ export default function App() {
               </p>
             </div>
 
-            {/* Alert component recipe for notice */}
+            {/* Read-Only Guarantee Notice */}
             <div className="flex gap-lg rounded-xl bg-utility-brand-50 p-xl">
               <Shield className="mt-xxs size-5 shrink-0 text-utility-brand-600" aria-hidden="true" />
               <div>
@@ -985,7 +1244,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Interactive RPC Console */}
+            {/* Live RPC Console */}
             <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs space-y-md">
               <div className="flex items-center justify-between">
                 <span className="text-sm font-medium text-secondary">
@@ -1070,24 +1329,12 @@ export default function App() {
               {rpcResult && (
                 <div className="space-y-xs">
                   <div className="flex items-center justify-between text-xs text-tertiary">
-                    <span>Gateway Result Verified by Tatum</span>
+                    <span>Real Gateway Result from Tatum ({rpcResult.gatewayUrl})</span>
                     <span className="font-mono">{rpcResult.timestamp}</span>
                   </div>
                   <pre className="p-md rounded-md bg-secondary border border-secondary font-mono text-xs text-primary overflow-x-auto leading-relaxed">
                     {JSON.stringify(rpcResult, null, 2)}
                   </pre>
-                </div>
-              )}
-
-              {!rpcResult && !rpcError && (
-                <div className="p-md rounded-md bg-secondary border border-secondary font-mono text-xs text-tertiary leading-relaxed">
-                  // Example Sui RPC Response Schema (Anchor for Memory Claim)<br />
-                  &#123;<br />
-                  &nbsp;&nbsp;"jsonrpc": "2.0",<br />
-                  &nbsp;&nbsp;"result": "82491204",<br />
-                  &nbsp;&nbsp;"network": "sui-mainnet",<br />
-                  &nbsp;&nbsp;"verifiedBy": "Tatum Managed Sui RPC Gateway"<br />
-                  &#125;
                 </div>
               )}
             </section>
@@ -1108,9 +1355,13 @@ export default function App() {
               <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs">
                 <p className="text-sm text-tertiary">Evaluated Ground Truths</p>
                 <p className="mt-md text-heading-xs font-semibold text-primary">
-                  {metrics?.evaluatedClaims ?? 10}
+                  {provenanceFilter === 'live_production'
+                    ? (metrics?.real.evaluatedClaims ?? 0)
+                    : (metrics?.aggregated.evaluatedClaims ?? 0)}
                 </p>
-                <p className="text-xs text-secondary mt-xs">Recorded across sessions</p>
+                <p className="text-xs text-secondary mt-xs">
+                  {metrics?.real.evaluatedClaims ?? 0} live evaluated
+                </p>
               </section>
 
               <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs">
@@ -1144,6 +1395,13 @@ export default function App() {
                       <div className="flex items-center gap-sm">
                         <span className="font-mono text-xs font-bold text-brand-primary">{dec.id}</span>
                         <h3 className="text-sm font-semibold text-primary">{dec.topic}</h3>
+                        <span className={`inline-flex items-center rounded-xs px-xs py-xxs font-mono text-[10px] uppercase ${
+                          dec.provenance === 'live_production'
+                            ? 'bg-utility-brand-50 text-utility-brand-700 border border-utility-brand-200'
+                            : 'bg-utility-gray-50 text-utility-gray-700 border border-utility-gray-200'
+                        }`}>
+                          {dec.provenance === 'live_production' ? 'Live' : 'Demo Seed'}
+                        </span>
                       </div>
                       <span className="inline-flex items-center gap-xs rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
                         Stance Revised
@@ -1188,16 +1446,25 @@ export default function App() {
 
             <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs">
               <div className="relative pl-6 space-y-lg border-l-2 border-secondary">
-                {timeline.map((item, idx) => (
+                {filteredTimeline.map((item, idx) => (
                   <div key={item.id || idx} className="relative space-y-xs">
                     <span className={`absolute -left-[31px] top-1 size-3 rounded-full ${
                       item.type === 'decision_update' ? 'bg-brand-solid' : 'bg-success-primary'
                     }`} />
                     <div className="flex items-center justify-between text-xs text-tertiary">
                       <span className="font-mono">{new Date(item.timestamp).toLocaleString()}</span>
-                      <span className="inline-flex items-center gap-xs rounded-full border border-utility-gray-200 bg-utility-gray-50 px-md py-xxs text-xs font-medium text-utility-gray-700 font-mono">
-                        {item.type}
-                      </span>
+                      <div className="flex items-center gap-xs">
+                        <span className={`inline-flex items-center rounded-xs px-xs py-xxs font-mono text-[10px] uppercase ${
+                          item.provenance === 'live_production'
+                            ? 'bg-utility-brand-50 text-utility-brand-700 border border-utility-brand-200'
+                            : 'bg-utility-gray-50 text-utility-gray-700 border border-utility-gray-200'
+                        }`}>
+                          {item.provenance === 'live_production' ? 'Live' : 'Demo'}
+                        </span>
+                        <span className="inline-flex items-center gap-xs rounded-full border border-utility-gray-200 bg-utility-gray-50 px-md py-xxs text-xs font-medium text-utility-gray-700 font-mono">
+                          {item.type}
+                        </span>
+                      </div>
                     </div>
                     <h3 className="text-sm font-semibold text-primary">{item.title}</h3>
                     <p className="text-xs text-secondary">{item.subtitle}</p>
@@ -1240,11 +1507,19 @@ export default function App() {
                   </div>
                   <div className="flex items-center justify-between py-xs border-b border-secondary">
                     <span className="text-secondary font-semibold">Storage Architecture:</span>
-                    <span className="text-primary font-medium">Walrus RedStuff 2D Reed-Solomon</span>
+                    <span className="text-primary font-medium">{sdkSpec?.storageEngine || 'Walrus RedStuff 2D Reed-Solomon'}</span>
+                  </div>
+                  <div className="flex items-center justify-between py-xs border-b border-secondary">
+                    <span className="text-secondary font-semibold">Active Walrus Publisher:</span>
+                    <span className="font-mono text-primary">{sdkSpec?.endpoints?.publisher}</span>
+                  </div>
+                  <div className="flex items-center justify-between py-xs border-b border-secondary">
+                    <span className="text-secondary font-semibold">Active Walrus Aggregator:</span>
+                    <span className="font-mono text-primary">{sdkSpec?.endpoints?.aggregator}</span>
                   </div>
                   <div className="flex items-center justify-between py-xs border-b border-secondary">
                     <span className="text-secondary font-semibold">Tatum Sui RPC Gateway:</span>
-                    <span className="font-mono text-primary">https://sui-mainnet.gateway.tatum.io</span>
+                    <span className="font-mono text-primary">{sdkSpec?.endpoints?.tatumSuiGateway}</span>
                   </div>
                 </div>
 
@@ -1272,7 +1547,7 @@ export default function App() {
                   </span>
                 </div>
                 <div className="flex-1 p-md rounded-md bg-secondary border border-secondary font-mono text-xs text-primary overflow-x-auto leading-relaxed">
-                  <pre>{sdkSpec?.samplePythonUsage || '// Loading SDK specification...'}</pre>
+                  <pre>{sdkSpec?.officialPythonExample || '// Loading SDK specification...'}</pre>
                 </div>
               </section>
             </div>
@@ -1286,7 +1561,7 @@ export default function App() {
           <div className="flex items-center gap-sm">
             <span className="font-semibold text-primary">RecallGuard</span>
             <span>•</span>
-            <span>Walrus Memory SDK (memwal)</span>
+            <span>Walrus Memory Protocol</span>
             <span>•</span>
             <span>Tatum Sui RPC</span>
           </div>

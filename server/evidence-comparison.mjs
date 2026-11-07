@@ -187,3 +187,48 @@ export function compareResearchEvidence(newSession, previousSessions) {
     currentValue
   }
 }
+
+/**
+ * Map an evidence comparison to a revision outcome.
+ *
+ * A `value_changed` comparison produces a pending evidence-change candidate,
+ * never a committed belief revision: the comparator explicitly requires
+ * independent verification first. Every other status produces neither a
+ * candidate nor a revision. The `committedRevision` slot exists so a future
+ * verified-commit path has a separate, explicit home; this path always
+ * leaves it null and never supersedes stored memories.
+ */
+export function buildRevisionOutcome(comparison, context = {}) {
+  if (!comparison || comparison.status !== 'value_changed') {
+    return { candidate: null, committedRevision: null }
+  }
+
+  const evidence = context.evidence ?? null
+
+  const candidate = {
+    id: context.candidateId ?? `CAND-${Date.now().toString().slice(-6)}`,
+    candidateType: 'evidence_change_candidate',
+    status: 'pending_verification',
+    verificationStatus: 'pending_independent_verification',
+    provenance: 'live_production',
+    capability: context.capability ?? null,
+    previousSessionId: comparison.comparedSessionId ?? null,
+    currentSessionId: context.currentSessionId ?? null,
+    previousValue: comparison.previousValue ?? null,
+    currentValue: comparison.currentValue ?? null,
+    sourceEvidence: evidence
+      ? {
+        capability: context.capability ?? null,
+        network: evidence.network ?? null,
+        operation: evidence.operation ?? null,
+        retrievedAt: evidence.retrievedAt ?? null,
+        evidenceStatus: evidence.evidenceStatus ?? null,
+        cryptographicallyVerified: false
+      }
+      : null,
+    reason: comparison.reason ?? null,
+    createdAt: new Date().toISOString()
+  }
+
+  return { candidate, committedRevision: null }
+}

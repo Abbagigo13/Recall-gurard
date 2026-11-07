@@ -4,8 +4,12 @@ import {
   rankMemories
 } from '../research-planner.mjs'
 import {
+  buildRevisionOutcome,
   compareResearchEvidence
 } from '../evidence-comparison.mjs'
+import { publishAndVerify, WALRUS_WRITE_ERROR_CODE } from '../walrus-storage.mjs'
+import { initStore, publicPersistenceError, PERSISTENCE_ERROR_CODE } from '../store.mjs'
+import { analyzeResearch, META_AI_ERROR_CODE, metaModel } from '../meta-ai.mjs'
 import {
   tatumFetch,
   tatumRpc,
@@ -166,6 +170,119 @@ const DEMO_DECISIONS = [
 let sessions = [...DEMO_SESSIONS]
 let memories = [...DEMO_MEMORIES]
 let decisions = [...DEMO_DECISIONS]
+// Pending evidence-change candidates awaiting independent verification.
+// Kept separate from `decisions` so a candidate is never presented as a
+// completed epistemic stance revision.
+let revisionCandidates = []
+
+// SQLite persistence (Phase 3). The store seeds demo rows once, migrates
+// live records by id, and reloads the arrays from the database so the DB is
+// the source of truth at boot. In a restricted preview without a writable
+// filesystem it degrades to explicit non-persistent memory mode.
+const { store: persistenceStore, sessions: storedSessions, memories: storedMemories, decisions: storedDecisions, revisionCandidates: storedCandidates } = initStore({
+  dbPath: process.env.RECALLGUARD_DB_PATH || './data/recallguard.db',
+  sessions,
+  memories,
+  decisions
+})
+sessions = storedSessions
+memories = storedMemories
+decisions = storedDecisions
+revisionCandidates = storedCandidates
+
+// Prompt version stamped on every persisted AI analysis row.
+export const AI_PROMPT_VERSION = '1.0.0'
+
+// Test seam for the integration below (also used by the HTTP suite via
+// getPersistenceStore). Production always uses the real Meta client and
+// the route's store; defaults keep that path intact.
+export function getPersistenceStore() {
+  return persistenceStore
+}
+
+// Meta AI interpretation for one persisted deterministic session.
+// Never throws: every outcome resolves to stable { aiStatus, aiAnalysis,
+// aiErrorCode }. The deterministic session, comparison, candidates, and
+// decisions are never touched here — AI output is interpretation only.
+// Every attempt is audited with one ai_analyses row (UNIQUE per session):
+// the validated analysis on success, or status/model/error-code only on
+// failure. A failed audit write reports persistence_failed and withholds
+// the analysis so storage is never misrepresented.
+export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn = analyzeResearch, store = persistenceStore } = {}) {
+  let result
+  try {
+    result = await analyzeFn({
+      question: newSession.question,
+      capability: newSession.researchPlan?.capability,
+      onChainSuiData: newSession.onChainSuiData ?? null,
+      recalledMemories: matchedMemories ?? [],
+      evidenceComparison: newSession.evidenceComparison ?? null
+    })
+  } catch {
+    result = { ok: false, aiStatus: 'unavailable', errorCode: META_AI_ERROR_CODE, analysis: null }
+  }
+
+  if (!result || result.ok !== true || !result.analysis) {
+    const aiStatus = result && (result.aiStatus === 'invalid' || result.aiStatus === 'unavailable')
+      ? result.aiStatus
+      : 'unavailable'
+    const errorCode = (result && result.errorCode) || META_AI_ERROR_CODE
+    // Audit the failed attempt with stable fields only: status, model,
+    // provider, prompt version, timestamp, and the stable error code.
+    // Never raw provider detail, request bodies, or model output.
+    let recorded = false
+    try {
+      recorded = store.persistAiAnalysis({
+        id: `AI-${newSession.id}`,
+        sessionId: newSession.id,
+        model: result && result.ran === false ? 'unknown' : metaModel(),
+        provider: 'meta',
+        promptVersion: AI_PROMPT_VERSION,
+        status: aiStatus,
+        analysis: null,
+        latencyMs: (result && result.latencyMs) ?? null,
+        errorCode
+      })
+    } catch {
+      recorded = false
+    }
+    if (!recorded) {
+      return { aiStatus: 'persistence_failed', aiAnalysis: null, aiErrorCode: PERSISTENCE_ERROR_CODE }
+    }
+    return {
+      aiStatus,
+      aiAnalysis: null,
+      aiErrorCode: errorCode
+    }
+  }
+
+  const { model, provider, ...analysisBody } = result.analysis
+  let persisted = false
+  try {
+    persisted = store.persistAiAnalysis({
+      id: `AI-${newSession.id}`,
+      sessionId: newSession.id,
+      model: result.analysis.model,
+      provider: result.analysis.provider || 'meta',
+      promptVersion: AI_PROMPT_VERSION,
+      status: 'completed',
+      analysis: analysisBody,
+      latencyMs: result.latencyMs ?? null,
+      errorCode: null
+    })
+  } catch {
+    persisted = false
+  }
+  if (!persisted) {
+    // The deterministic session stays intact; only the status reports that
+    // the analysis write did not land. The analysis body is withheld so a
+    // stored analysis is never implied. The code names the SQLite layer,
+    // never the Meta provider, so provider vs persistence failures stay
+    // distinguishable.
+    return { aiStatus: 'persistence_failed', aiAnalysis: null, aiErrorCode: PERSISTENCE_ERROR_CODE }
+  }
+  return { aiStatus: 'completed', aiAnalysis: result.analysis, aiErrorCode: null }
+}
 
 // --------------------------------------------------------------------------
 // 1. Health check & Integration Status Endpoint (/api/recallguard/health)
@@ -284,7 +401,9 @@ router.get('/health', async (_req, res) => {
       demoMemories: memories.filter(
         m => m.provenance === 'demo_seed'
       ).length
-    }
+    },
+
+    persistence: persistenceStore.getStatus()
   })
 })
 
@@ -585,7 +704,92 @@ router.post('/sessions', async (req, res) => {
       : 'No matching local memories were found.'
   }
 
+  // 4b. Compare live evidence against previous live observations.
+  // Read-only: previous sessions are never mutated here, and demo_seed
+  // records are excluded inside compareResearchEvidence. A value change
+  // yields a pending candidate only — committed revisions live in
+  // `decisions` and are never auto-created on this path.
+  let evidenceComparison = null
+  let liveDecision = null
+  let revisionCandidate = null
+
+  try {
+    evidenceComparison = compareResearchEvidence(newSession, sessions)
+  } catch {
+    evidenceComparison = {
+      status: 'insufficient_evidence',
+      reason: 'Evidence comparison could not be completed.',
+      revision: null
+    }
+  }
+
+  newSession.evidenceComparison = {
+    status: evidenceComparison.status,
+    reason: evidenceComparison.reason,
+    comparedSessionId: evidenceComparison.comparedSessionId ?? null,
+    previousValue: evidenceComparison.previousValue ?? null,
+    currentValue: evidenceComparison.currentValue ?? null
+  }
+
+  if (
+    evidenceComparison.status === 'consistent_observation' ||
+    evidenceComparison.status === 'newer_observation' ||
+    evidenceComparison.status === 'value_changed' ||
+    evidenceComparison.status === 'unexpected_regression'
+  ) {
+    claims.push({
+      id: `CLM-${Date.now()}-CMP`,
+      text: `Evidence comparison (${evidenceComparison.status}): ${evidenceComparison.reason}`,
+      type: 'evidence_comparison',
+      source: 'RecallGuard Evidence Comparison Engine',
+      details: {
+        comparedSessionId: newSession.evidenceComparison.comparedSessionId,
+        previousValue: newSession.evidenceComparison.previousValue,
+        currentValue: newSession.evidenceComparison.currentValue
+      }
+    })
+  }
+
+  // A newer checkpoint/epoch sequence is an update, never a contradiction.
+  // A genuine value change records a pending evidence-change candidate for
+  // independent verification — never a committed revision, and no stored
+  // memory is superseded here.
+  {
+    const outcome = buildRevisionOutcome(evidenceComparison, {
+      evidence: onChainSuiData,
+      capability: researchPlan.capability,
+      currentSessionId: newSession.id,
+      candidateId: `CAND-LIVE-${Date.now().toString().slice(-6)}`
+    })
+
+    revisionCandidate = outcome.candidate
+    liveDecision = outcome.committedRevision
+
+    if (revisionCandidate) {
+      newSession.revisionCandidate = revisionCandidate
+
+      newSession.learningDelta =
+        `${newSession.learningDelta} Evidence change candidate recorded vs ${revisionCandidate.previousSessionId}; pending independent verification.`
+    }
+  }
+
+  // Persist before exposing: the database write must succeed before the
+  // record appears in memory, GET endpoints, or the dashboard. A failed
+  // write returns 500 with no phantom record. The atomic helper inserts
+  // the session row first so the candidate's foreign keys resolve in the
+  // same transaction.
+  const sessionPersisted = revisionCandidate
+    ? persistenceStore.persistSessionWithCandidate(newSession, revisionCandidate)
+    : persistenceStore.persistSession(newSession)
+  if (!sessionPersisted) {
+    // Public body carries only a stable code; raw driver detail was logged
+    // server-side inside the store and never leaves the process.
+    return res.status(500).json(publicPersistenceError('research session'))
+  }
   sessions.unshift(newSession)
+  if (revisionCandidate) {
+    revisionCandidates.unshift(revisionCandidate)
+  }
 
 
   // 5. Attempt to store the session finding in Walrus.
@@ -605,114 +809,40 @@ router.post('/sessions', async (req, res) => {
       onChainObservation: onChainSuiData
     })
 
-    // 1. Publish the memory to Walrus.
-    const pubRes = await fetch(
-      `${DEFAULT_WALRUS_PUBLISHER}/v1/blobs?epochs=1`,
-      {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: memoryPayload,
-        signal: AbortSignal.timeout(18000)
-      }
-    )
+    // 1-2. Publish and exact-byte verify via the shared helper.
+    // A failed write never discards the session: it is recorded in
+    // walrusStoreError while the session and its evidence stay intact.
+    // Read-back equality confirms byte fidelity only, never claim truth.
+    const walrusResult = await publishAndVerify(memoryPayload, {
+      publisherUrl: DEFAULT_WALRUS_PUBLISHER,
+      aggregatorUrl: DEFAULT_WALRUS_AGGREGATOR
+    })
 
-    if (!pubRes.ok) {
-      walrusStoreError =
-        `Walrus publisher returned HTTP ${pubRes.status}`
+    const blobId = walrusResult.blobId
+    const suiObjectId = walrusResult.suiObjectId
+    const aggregatorUrl = walrusResult.aggregatorUrl
+    const storageVerified = walrusResult.storageVerified === true
+    const storageStatus = walrusResult.storageStatus
+    const readbackError = walrusResult.error
+
+    if (walrusResult.writeStatus !== 'accepted') {
+      walrusStoreResult = null
+      walrusStoreError = walrusResult.error
     } else {
-      const pubData = await pubRes.json()
-
-      const blobId =
-        pubData.newlyCreated?.blobObject?.blobId ||
-        pubData.alreadyCertified?.blobId ||
-        null
-
-      const suiObjectId =
-        pubData.newlyCreated?.blobObject?.id || null
-
-      const aggregatorUrl = blobId
-        ? `${DEFAULT_WALRUS_AGGREGATOR}/v1/blobs/${blobId}`
-        : null
-
-      // 2. Verify the upload by reading it back.
-      let storageVerified = false
-      let storageStatus = 'write_accepted_unverified'
-      let readbackError = null
-      let readbackAttempts = 0
-
-      if (aggregatorUrl) {
-           const retryDelays = [500, 1000, 2000, 3000]
-    let lastReadbackError = null
-
-    for (let attempt = 0; attempt < 5; attempt++) {
-      readbackAttempts = attempt + 1
-      try {
-        const readbackRes = await fetch(aggregatorUrl, {
-          signal: AbortSignal.timeout(12000)
-        })
-
-        if (readbackRes.ok) {
-          const retrievedPayload = await readbackRes.text()
-
-          if (retrievedPayload === memoryPayload) {
-            storageVerified = true
-            storageStatus = 'verified_readback'
-            readbackError = null
-          } else {
-            readbackError =
-              'Retrieved blob does not exactly match the uploaded payload.'
-            storageStatus = 'readback_mismatch'
-          }
-
-          break
-        }
-
-        lastReadbackError =
-          `Walrus read-back returned HTTP ${readbackRes.status}`
-
-        if (
-          readbackRes.status !== 404 &&
-          readbackRes.status < 500
-        ) {
-          break
-        }
-      } catch (error) {
-        lastReadbackError =
-          `Walrus read-back failed: ${error.message}`
-      }
-
-      if (attempt < 4) {
-        await new Promise(resolve =>
-          setTimeout(resolve, retryDelays[attempt])
-        )
-      }
-    }
-
-    if (!storageVerified && storageStatus !== 'readback_mismatch') {
-      readbackError =
-        lastReadbackError || 'Walrus read-back failed after retries.'
-      storageStatus = 'readback_failed'
-    }
-      } else {
-        readbackError = 'Publisher response did not contain a blob ID.'
-        storageStatus = 'missing_blob_id'
-      }
-
       // 3. Record the actual verification result.
       walrusStoreResult = {
         blobId,
         suiObjectId,
         aggregatorUrl,
-        readbackAttempts,
-        cost: pubData.newlyCreated?.cost || null,
-        certifiedEpoch:
-          pubData.newlyCreated?.blobObject?.registeredEpoch || null,
+        readbackAttempts: walrusResult.readbackAttempts,
+        cost: walrusResult.cost,
+        certifiedEpoch: walrusResult.certifiedEpoch,
         writeStatus: 'accepted',
         storageVerified,
         storageStatus,
-        readbackError
+        readbackError,
+        publishAttempts: walrusResult.publishAttempts,
+        latencyMs: walrusResult.totalLatencyMs
       }
 
 const sourceReferenceByCapability = {
@@ -748,26 +878,55 @@ const sourceReference =
         storageStatus
       }
 
-      memories.unshift(storedMemory)
+      // The session above is already persisted; a Walrus failure never
+      // discards it. The derived memory record follows the same
+      // persist-before-expose rule: no phantom record on DB failure.
+      if (persistenceStore.persistMemory(storedMemory)) {
+        memories.unshift(storedMemory)
+      } else {
+        // Fixed public message: raw driver detail was logged server-side
+        // inside the store. Response contract unchanged (201 with
+        // storedMemory: null and a walrusStoreError string).
+        walrusStoreError =
+          'Session persisted, but its memory record could not be written to the database.'
+        storedMemory = null
+      }
 
       if (!storageVerified) {
         walrusStoreError = readbackError
       }
     }
   } catch (error) {
-    walrusStoreError =
-      `Walrus publisher communication failed: ${error.message}`
+    // Fixed public message; raw exception detail goes to server logs only.
+    console.error(`[recallguard] POST /sessions Walrus publish failed: ${error.message}`)
+    walrusStoreError = 'Walrus publisher communication failed.'
   }
 
         
-  // 6. Preserve the existing API response structure.
+  // 5b. Meta AI interpretation (additive, never authoritative). Runs only
+  // after the deterministic session is durable and the Walrus attempt has
+  // resolved. Any AI or analysis-persistence failure degrades to an explicit
+  // aiStatus; the session, comparison, candidates, and Walrus results are
+  // unaffected, and AI output can never alter them (it is not consulted
+  // above this line).
+  const { aiStatus, aiAnalysis, aiErrorCode } = await resolveAiAnalysis(newSession, matchedMemories)
+
+  // 6. Preserve the existing API response structure (additive fields only).
+  // `liveDecision` stays null on this path: only a future verified-commit
+  // flow may set it. Pending work is reported via `revisionCandidate`.
   res.status(201).json({
     session: newSession,
     storedMemory,
     walrusStoreResult,
     walrusStoreError,
     onChainSuiData,
-    onChainError
+    onChainError,
+    evidenceComparison: newSession.evidenceComparison,
+    liveDecision,
+    revisionCandidate,
+    aiAnalysis,
+    aiStatus,
+    aiErrorCode
   })
 })
 
@@ -807,24 +966,34 @@ router.post('/memories', async (req, res) => {
   })
 
   try {
-    const pubRes = await fetch(`${DEFAULT_WALRUS_PUBLISHER}/v1/blobs?epochs=1`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: memoryPayload,
-      signal: AbortSignal.timeout(18000)
+    // Same verification rules as research sessions: publish with bounded
+    // retries, then require exact-byte read-back before verified storage.
+    // Read-back equality confirms byte fidelity only, never claim truth.
+    const walrusResult = await publishAndVerify(memoryPayload, {
+      publisherUrl: DEFAULT_WALRUS_PUBLISHER,
+      aggregatorUrl: DEFAULT_WALRUS_AGGREGATOR
     })
 
-    if (!pubRes.ok) {
-      const errText = await pubRes.text()
-      return res.status(pubRes.status).json({
-        error: `Walrus storage rejected operation (HTTP ${pubRes.status})`,
-        details: errText
+    if (walrusResult.writeStatus !== 'accepted') {
+      // Stable public bodies only; helper detail was designed body-free and
+      // the raw form goes to server logs.
+      console.error(`[recallguard] POST /memories Walrus write failed: ${walrusResult.error}`)
+      const httpStatus = walrusResult.publishHttpStatus
+      if (httpStatus && (httpStatus < 200 || httpStatus >= 300)) {
+        return res.status(httpStatus).json({
+          error: 'Walrus storage rejected operation',
+          code: WALRUS_WRITE_ERROR_CODE
+        })
+      }
+      return res.status(502).json({
+        error: 'Failed to write memory blob to Walrus storage',
+        code: WALRUS_WRITE_ERROR_CODE
       })
     }
 
-    const pubData = await pubRes.json()
-    const blobId = pubData.newlyCreated?.blobObject?.blobId || pubData.alreadyCertified?.blobId
-    const suiObjectId = pubData.newlyCreated?.blobObject?.id || null
+    const blobId = walrusResult.blobId
+    const suiObjectId = walrusResult.suiObjectId
+    const pubData = walrusResult.publisherResponse
 
     
 const newMemory = {
@@ -836,17 +1005,22 @@ const newMemory = {
   sourceReference,
   walrusBlobId: blobId,
   walrusSuiObjectId: suiObjectId,
-  walrusAggregatorUrl: blobId
-    ? `${DEFAULT_WALRUS_AGGREGATOR}/v1/blobs/${blobId}`
-    : null,
+  walrusAggregatorUrl: walrusResult.aggregatorUrl,
   createdAt: new Date().toISOString(),
   status: 'active',
   reliabilityScore: null,
-  storageVerified: false,
-  storageStatus: 'write_accepted_unverified'
+  storageVerified: walrusResult.storageVerified === true,
+  storageStatus: walrusResult.storageStatus
 }
 
 
+    // Persist before exposing: a failed database write returns 500 with
+    // no phantom record in GET /memories or the dashboard.
+    if (!persistenceStore.persistMemory(newMemory)) {
+      // Public body carries only a stable code; raw driver detail was logged
+      // server-side inside the store and never leaves the process.
+      return res.status(500).json(publicPersistenceError('memory record'))
+    }
     memories.unshift(newMemory)
     res.status(201).json({
       success: true,
@@ -854,9 +1028,11 @@ const newMemory = {
       walrusRawResponse: pubData
     })
   } catch (err) {
+    // Raw exception text goes to server logs only; the public body is fixed.
+    console.error(`[recallguard] POST /memories Walrus request failed: ${err.message}`)
     res.status(502).json({
       error: 'Failed to write memory blob to Walrus storage',
-      details: err.message
+      code: WALRUS_WRITE_ERROR_CODE
     })
   }
 })

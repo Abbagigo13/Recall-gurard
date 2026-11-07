@@ -1,6 +1,6 @@
-
+import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { compareResearchEvidence } from './evidence-comparison.mjs'
+import { buildRevisionOutcome, compareResearchEvidence } from './evidence-comparison.mjs'
 
 function makeSession({
   id,
@@ -30,91 +30,332 @@ function makeSession({
 const olderTime = '2026-11-06T10:00:00.000Z'
 const newerTime = '2026-11-06T11:00:00.000Z'
 
-// Test 1: Identical checkpoint observations.
-{
-  const previous = makeSession({
-    id: 'SES-001',
-    value: 100,
-    timestamp: olderTime
+describe('evidence comparison', () => {
+  it('treats identical checkpoint observations as consistent', () => {
+    const previous = makeSession({
+      id: 'SES-001',
+      value: 100,
+      timestamp: olderTime
+    })
+
+    const current = makeSession({
+      id: 'SES-002',
+      value: 100,
+      timestamp: newerTime
+    })
+
+    const result = compareResearchEvidence(current, [previous])
+
+    assert.equal(result.status, 'consistent_observation')
+    assert.equal(result.revision, null)
   })
 
-  const current = makeSession({
-    id: 'SES-002',
-    value: 100,
-    timestamp: newerTime
+  it('treats a newer checkpoint as an update, not a contradiction', () => {
+    const previous = makeSession({
+      id: 'SES-003',
+      value: 100,
+      timestamp: olderTime
+    })
+
+    const current = makeSession({
+      id: 'SES-004',
+      value: 105,
+      timestamp: newerTime
+    })
+
+    const result = compareResearchEvidence(current, [previous])
+
+    assert.equal(result.status, 'newer_observation')
+    assert.equal(result.revision, null)
   })
 
-  const result = compareResearchEvidence(current, [previous])
+  it('flags a changed chain identifier for further verification', () => {
+    const previous = makeSession({
+      id: 'SES-005',
+      capability: 'sui_chain_identifier',
+      value: 'chain-old',
+      timestamp: olderTime
+    })
 
-  assert.equal(result.status, 'consistent_observation')
-  assert.equal(result.revision, null)
-  console.log('PASS: Identical observations are consistent')
-}
+    const current = makeSession({
+      id: 'SES-006',
+      capability: 'sui_chain_identifier',
+      value: 'chain-new',
+      timestamp: newerTime
+    })
 
-// Test 2: A newer checkpoint is an update, not a contradiction.
-{
-  const previous = makeSession({
-    id: 'SES-003',
-    value: 100,
-    timestamp: olderTime
+    const result = compareResearchEvidence(current, [previous])
+
+    assert.equal(result.status, 'value_changed')
+    assert.equal(result.revision, null)
   })
 
-  const current = makeSession({
-    id: 'SES-004',
-    value: 105,
-    timestamp: newerTime
+  it('excludes demo records from live comparisons', () => {
+    const demoPrevious = makeSession({
+      id: 'DEMO-001',
+      value: 100,
+      timestamp: olderTime,
+      provenance: 'demo_seed'
+    })
+
+    const current = makeSession({
+      id: 'SES-007',
+      value: 105,
+      timestamp: newerTime
+    })
+
+    const result = compareResearchEvidence(current, [demoPrevious])
+
+    assert.equal(result.status, 'no_comparable_prior_evidence')
+    assert.equal(result.revision, null)
   })
 
-  const result = compareResearchEvidence(current, [previous])
+  it('flags a changed object digest as a value change without committing a revision', () => {
+    const previous = {
+      id: 'SES-010',
+      provenance: 'live_production',
+      status: 'completed',
+      createdAt: olderTime,
+      researchPlan: { capability: 'sui_object_lookup' },
+      onChainSuiData: {
+        network: 'sui-mainnet',
+        objectId: '0xabc',
+        object: { digest: 'digest-old' },
+        retrievedAt: olderTime
+      }
+    }
 
-  assert.equal(result.status, 'newer_observation')
-  assert.equal(result.revision, null)
-  console.log('PASS: Newer checkpoint is not classified as a contradiction')
-}
+    const current = {
+      id: 'SES-011',
+      provenance: 'live_production',
+      status: 'completed',
+      createdAt: newerTime,
+      researchPlan: { capability: 'sui_object_lookup' },
+      onChainSuiData: {
+        network: 'sui-mainnet',
+        objectId: '0xABC',
+        object: { digest: 'digest-new' },
+        retrievedAt: newerTime
+      }
+    }
 
-// Test 3: A changed chain identifier requires further verification.
-{
-  const previous = makeSession({
-    id: 'SES-005',
-    capability: 'sui_chain_identifier',
-    value: 'chain-old',
-    timestamp: olderTime
+    const result = compareResearchEvidence(current, [previous])
+
+    assert.equal(result.status, 'value_changed')
+    assert.equal(result.revision, null)
+    assert.equal(result.previousValue, 'digest-old')
+    assert.equal(result.currentValue, 'digest-new')
   })
 
-  const current = makeSession({
-    id: 'SES-006',
-    capability: 'sui_chain_identifier',
-    value: 'chain-new',
-    timestamp: newerTime
+  it('treats an advanced epoch as an update, not a contradiction', () => {
+    const previous = {
+      id: 'SES-012',
+      provenance: 'live_production',
+      status: 'completed',
+      createdAt: olderTime,
+      researchPlan: { capability: 'sui_network_status' },
+      onChainSuiData: {
+        network: 'sui-mainnet',
+        serviceInfo: { epoch: '10' },
+        retrievedAt: olderTime
+      }
+    }
+
+    const current = {
+      id: 'SES-013',
+      provenance: 'live_production',
+      status: 'completed',
+      createdAt: newerTime,
+      researchPlan: { capability: 'sui_network_status' },
+      onChainSuiData: {
+        network: 'sui-mainnet',
+        serviceInfo: { epoch: '11' },
+        retrievedAt: newerTime
+      }
+    }
+
+    const result = compareResearchEvidence(current, [previous])
+
+    assert.equal(result.status, 'newer_observation')
+    assert.equal(result.revision, null)
   })
 
-  const result = compareResearchEvidence(current, [previous])
+  it('reports a regressing checkpoint without committing a revision', () => {
+    const previous = makeSession({
+      id: 'SES-014',
+      value: 105,
+      timestamp: olderTime
+    })
 
-  assert.equal(result.status, 'value_changed')
-  assert.equal(result.revision, null)
-  console.log('PASS: Changed chain identifier is flagged for further verification')
-}
+    const current = makeSession({
+      id: 'SES-015',
+      value: 100,
+      timestamp: newerTime
+    })
 
-// Test 4: Demo records cannot become live comparison evidence.
-{
-  const demoPrevious = makeSession({
-    id: 'DEMO-001',
-    value: 100,
-    timestamp: olderTime,
-    provenance: 'demo_seed'
+    const result = compareResearchEvidence(current, [previous])
+
+    assert.equal(result.status, 'unexpected_regression')
+    assert.equal(result.revision, null)
   })
 
-  const current = makeSession({
-    id: 'SES-007',
-    value: 105,
-    timestamp: newerTime
+  it('yields insufficient evidence for memory-only analysis', () => {
+    const current = {
+      id: 'SES-016',
+      provenance: 'live_production',
+      status: 'completed',
+      createdAt: newerTime,
+      researchPlan: { capability: 'memory_and_scope_analysis' },
+      onChainSuiData: null
+    }
+
+    const previous = makeSession({
+      id: 'SES-017',
+      value: 100,
+      timestamp: olderTime
+    })
+
+    const result = compareResearchEvidence(current, [previous])
+
+    assert.equal(result.status, 'insufficient_evidence')
+    assert.equal(result.revision, null)
   })
 
-  const result = compareResearchEvidence(current, [demoPrevious])
+  it('turns value_changed into a pending candidate, never a committed revision', () => {
+    const previous = makeSession({
+      id: 'SES-020',
+      capability: 'sui_chain_identifier',
+      value: 'chain-old',
+      timestamp: olderTime
+    })
 
-  assert.equal(result.status, 'no_comparable_prior_evidence')
-  assert.equal(result.revision, null)
-  console.log('PASS: Demo records are excluded from live comparisons')
-}
+    const current = {
+      id: 'SES-021',
+      provenance: 'live_production',
+      status: 'completed',
+      createdAt: newerTime,
+      researchPlan: { capability: 'sui_chain_identifier' },
+      onChainSuiData: {
+        network: 'sui-mainnet',
+        operation: 'sui_chain_identifier',
+        chainId: 'chain-new',
+        retrievedAt: newerTime,
+        evidenceStatus: 'retrieved_from_tatum',
+        cryptographicallyVerified: false
+      }
+    }
 
-console.log('\nAll evidence comparison tests passed.')
+    const comparison = compareResearchEvidence(current, [previous])
+    assert.equal(comparison.status, 'value_changed')
+
+    const outcome = buildRevisionOutcome(comparison, {
+      evidence: current.onChainSuiData,
+      capability: 'sui_chain_identifier',
+      currentSessionId: current.id,
+      candidateId: 'CAND-TEST-001'
+    })
+
+    assert.equal(outcome.committedRevision, null)
+    assert.ok(outcome.candidate)
+    assert.equal(outcome.candidate.candidateType, 'evidence_change_candidate')
+    assert.equal(outcome.candidate.status, 'pending_verification')
+    assert.equal(outcome.candidate.verificationStatus, 'pending_independent_verification')
+    assert.equal(outcome.candidate.previousValue, 'chain-old')
+    assert.equal(outcome.candidate.currentValue, 'chain-new')
+    assert.equal(outcome.candidate.previousSessionId, 'SES-020')
+    assert.equal(outcome.candidate.currentSessionId, 'SES-021')
+    assert.equal(outcome.candidate.sourceEvidence.network, 'sui-mainnet')
+    assert.equal(outcome.candidate.sourceEvidence.cryptographicallyVerified, false)
+  })
+
+  it('creates neither candidate nor revision on checkpoint advance', () => {
+    const previous = makeSession({
+      id: 'SES-022',
+      value: 100,
+      timestamp: olderTime
+    })
+
+    const current = makeSession({
+      id: 'SES-023',
+      value: 105,
+      timestamp: newerTime
+    })
+
+    const comparison = compareResearchEvidence(current, [previous])
+    assert.equal(comparison.status, 'newer_observation')
+
+    const outcome = buildRevisionOutcome(comparison, {
+      evidence: current.onChainSuiData,
+      capability: 'sui_checkpoint_status',
+      currentSessionId: current.id,
+      candidateId: 'CAND-TEST-002'
+    })
+
+    assert.equal(outcome.candidate, null)
+    assert.equal(outcome.committedRevision, null)
+  })
+
+  it('creates neither candidate nor revision on checkpoint regression', () => {
+    const previous = makeSession({
+      id: 'SES-024',
+      value: 105,
+      timestamp: olderTime
+    })
+
+    const current = makeSession({
+      id: 'SES-025',
+      value: 100,
+      timestamp: newerTime
+    })
+
+    const comparison = compareResearchEvidence(current, [previous])
+    assert.equal(comparison.status, 'unexpected_regression')
+
+    const outcome = buildRevisionOutcome(comparison, {
+      evidence: current.onChainSuiData,
+      capability: 'sui_checkpoint_status',
+      currentSessionId: current.id,
+      candidateId: 'CAND-TEST-003'
+    })
+
+    assert.equal(outcome.candidate, null)
+    assert.equal(outcome.committedRevision, null)
+  })
+
+  it('leaves consistent and insufficient evidence with nothing committable', () => {
+    const previous = makeSession({
+      id: 'SES-026',
+      value: 100,
+      timestamp: olderTime
+    })
+
+    const consistent = makeSession({
+      id: 'SES-027',
+      value: 100,
+      timestamp: newerTime
+    })
+
+    const consistentOutcome = buildRevisionOutcome(
+      compareResearchEvidence(consistent, [previous]),
+      { currentSessionId: consistent.id, candidateId: 'CAND-TEST-004' }
+    )
+    assert.equal(consistentOutcome.candidate, null)
+    assert.equal(consistentOutcome.committedRevision, null)
+
+    const memoryOnly = {
+      id: 'SES-028',
+      provenance: 'live_production',
+      status: 'completed',
+      createdAt: newerTime,
+      researchPlan: { capability: 'memory_and_scope_analysis' },
+      onChainSuiData: null
+    }
+
+    const insufficientOutcome = buildRevisionOutcome(
+      compareResearchEvidence(memoryOnly, [previous]),
+      { currentSessionId: memoryOnly.id, candidateId: 'CAND-TEST-005' }
+    )
+    assert.equal(insufficientOutcome.candidate, null)
+    assert.equal(insufficientOutcome.committedRevision, null)
+  })
+})

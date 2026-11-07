@@ -6,6 +6,8 @@
     "dev": "node server/index.mjs"
   },
   "dependencies": {
+    "@grpc/grpc-js": "^1.14.7",
+    "@grpc/proto-loader": "^0.8.1",
     "@vitejs/plugin-react": "^4.3.1",
     "express": "^4.21.0",
     "lucide-react": "^1.31.0",

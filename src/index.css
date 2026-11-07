@@ -1,15 +1,128 @@
-/* The design-system CSS variables every token class resolves to. Must stay the
-   first statement — CSS @import is only valid ahead of other rules. */
+/* Keep this import first: design-tokens/tokens.css is generated and owns the palettes. */
 @import '../design-tokens/tokens.css';
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* Tatum foundation — read through the tokens, never hardcoded. The full system
-   (component anatomy, states, layout) is in the `tatum-design` skill. */
+:root {
+  color-scheme: light;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+:root[data-theme='dark'] { color-scheme: dark; }
+
+html { min-width: 320px; scroll-behavior: smooth; }
 body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
   background-color: var(--color-bg-primary);
   color: var(--color-text-primary);
   font-family: var(--font-family-sans);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+button, input, select, textarea { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+img, svg { max-width: 100%; }
+
+:focus-visible {
+  outline: 2px solid var(--color-border-focus, #647de8);
+  outline-offset: 3px;
+}
+
+::selection { background: var(--color-bg-brand, #dbeafe); color: var(--color-text-primary); }
+
+.app-header { backdrop-filter: blur(14px); background: color-mix(in srgb, var(--color-bg-primary) 92%, transparent); }
+.header-actions { flex-shrink: 0; }
+.theme-toggle {
+  display: inline-flex; align-items: center; justify-content: center; gap: .5rem;
+  min-height: 38px; padding: .45rem .8rem; border: 1px solid var(--color-border-secondary);
+  border-radius: .65rem; background: var(--color-bg-secondary); color: var(--color-text-primary);
+  font-size: .8rem; font-weight: 600; transition: background .18s ease, border-color .18s ease, transform .18s ease;
+}
+.theme-toggle:hover { background: var(--color-bg-tertiary); transform: translateY(-1px); }
+.mobile-menu-toggle { display: none; align-items: center; justify-content: center; width: 40px; height: 40px; border: 1px solid var(--color-border-secondary); border-radius: .65rem; background: var(--color-bg-secondary); color: var(--color-text-primary); }
+.app-nav { min-width: 0; gap: 1rem; }
+.nav-tabs { min-width: 0; overflow-x: auto; scrollbar-width: thin; }
+.nav-tabs button { white-space: nowrap; }
+.app-main { min-height: 55vh; }
+
+/* Loading skeletons */
+.skeleton-screen { width: 100%; }
+.skeleton-card, .skeleton-line {
+  position: relative; overflow: hidden; border-radius: .65rem;
+  background: var(--color-bg-secondary);
+}
+.skeleton-card { min-height: 150px; padding: 1.25rem; border: 1px solid var(--color-border-secondary); }
+.skeleton-panel { min-height: 260px; }
+.skeleton-line { height: 12px; margin-bottom: .85rem; background: var(--color-bg-tertiary); }
+.skeleton-title { width: min(360px, 65%); height: 28px; }
+.skeleton-subtitle { width: min(520px, 85%); height: 13px; }
+.skeleton-number { width: 42%; height: 34px; margin: 1.25rem 0; }
+.skeleton-card::after, .skeleton-line::after {
+  content: ''; position: absolute; inset: 0; transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--color-text-primary) 7%, transparent), transparent);
+  animation: skeleton-shimmer 1.35s infinite;
+}
+@keyframes skeleton-shimmer { 100% { transform: translateX(100%); } }
+
+/* Toast feedback */
+.toast {
+  position: fixed; z-index: 100; right: 1.25rem; bottom: 1.25rem; display: flex; align-items: center; gap: .75rem;
+  width: min(440px, calc(100vw - 2rem)); padding: .9rem 1rem; border: 1px solid var(--color-border-secondary);
+  border-radius: .85rem; background: var(--color-bg-primary); color: var(--color-text-primary);
+  box-shadow: 0 18px 55px rgb(0 0 0 / .16); animation: toast-in .2s ease-out;
+}
+.toast-success { border-color: #16a34a66; }
+.toast-error { border-color: #dc262666; }
+.toast-info { border-color: #2563eb66; }
+.toast button { margin-left: auto; border: 0; background: transparent; color: inherit; font-size: 1.4rem; line-height: 1; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+/* Prevent wide evidence output and tables from breaking the viewport. */
+pre { max-width: 100%; white-space: pre; overflow: auto; }
+.responsive-table { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.responsive-table table { min-width: 900px; }
+input, select, textarea { max-width: 100%; }
+
+@media (max-width: 900px) {
+  .app-header > div:first-child { align-items: flex-start; }
+  .app-header .max-w-7xl > div:first-child { flex-wrap: wrap; }
+  .app-nav { align-items: flex-start; }
+  .nav-tabs { gap: .5rem; }
+}
+
+@media (max-width: 700px) {
+  .app-header { padding: .85rem 1rem; }
+  .app-header > div:first-child { gap: .65rem; }
+  .app-header .max-w-7xl > div:first-child { flex-wrap: nowrap; }
+  .app-header .max-w-7xl > div:first-child > div:first-child { min-width: 0; }
+  .app-header .max-w-7xl > div:first-child p { max-width: 220px; line-height: 1.35; }
+  .header-actions { gap: .45rem; }
+  .theme-toggle { width: 40px; padding: 0; }
+  .theme-toggle-label { display: none; }
+  .mobile-menu-toggle { display: inline-flex; }
+  .app-nav { display: none; margin-top: .75rem; padding-top: .75rem; border-bottom: 0; flex-direction: column; }
+  .app-nav.is-open { display: flex; }
+  .nav-tabs { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: visible; gap: .4rem; }
+  .nav-tabs button { text-align: left; border: 1px solid var(--color-border-secondary); border-radius: .55rem; padding: .65rem .7rem; font-size: .78rem; }
+  .app-nav > div:last-child { width: 100%; padding: .4rem 0; justify-content: space-between; }
+  .app-main { padding: 1rem !important; }
+  .app-main h1 { font-size: clamp(1.35rem, 5vw, 1.8rem); line-height: 1.2; }
+  .app-main .flex.items-center.justify-between { flex-wrap: wrap; gap: .75rem; }
+  .app-main form .flex.gap-sm { flex-direction: column; }
+  .app-main form button[type='submit'] { width: 100%; justify-content: center; }
+  .app-main .grid { min-width: 0; }
+  .app-main section, .app-main form { padding: 1rem !important; }
+  footer > div { flex-direction: column; align-items: flex-start !important; gap: .5rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }

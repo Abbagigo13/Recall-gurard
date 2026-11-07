@@ -10,6 +10,7 @@
 RecallGuard is a production-grade AI research engine that learns across iterative research sessions, preserves evidence in persistent decentralized memory, and dynamically refines its conclusions when verifiable on-chain facts contradict prior assumptions.
 
 Unlike typical stateless AI agents that hallucinate or repeat obsolete claims, RecallGuard:
+
 1. **Remembers** past claims, hypotheses, and evidence vectors using decentralized persistent memory specifications (compatible with the official Walrus Memory Python SDK `memwal`).
 2. **Verifies** on-chain facts directly through Tatum's managed Sui JSON-RPC gateway without requesting wallet transactions or exposing private keys.
 3. **Evolves transparently** through an empirical Learning Engine that logs epistemic shifts, explains why prior conclusions were superseded, and measures performance without fabricating metrics.
@@ -39,7 +40,8 @@ Unlike typical stateless AI agents that hallucinate or repeat obsolete claims, R
                   └─────────────────────────┘      └─────────────────────────┘
 ```
 
-### Module Breakdown:
+### Module Breakdown
+
 - **Research Workspace**: User-facing inquiry cockpit. Runs semantic retrieval against past memories and evaluates claims categorized into:
   - `Verified Facts`: Cryptographically provable data anchored via Tatum Sui RPC.
   - `Unverified Claims`: Speculative or third-party web community assertions.
@@ -64,12 +66,14 @@ RecallGuard implements memory integration tailored for the official Walrus Memor
 ## 4. Getting Started
 
 ### Prerequisites
+
 - Node.js 18+
 - Tatum API Key (from [co.tatum.io](https://co.tatum.io))
 
 ### Setup Instructions
 
 1. **Clone and Install Dependencies**:
+
    ```bash
    git clone <repo-url>
    cd recallguard
@@ -77,19 +81,24 @@ RecallGuard implements memory integration tailored for the official Walrus Memor
    ```
 
 2. **Configure Environment Variables**:
+
    ```bash
    cp .env.example .env
    ```
+
    Add your Tatum API key:
+
    ```env
    TATUM_API_KEY=your_tatum_api_key_here
    ```
 
 3. **Run the Application**:
+
    ```bash
    npm run dev
    # or node server/index.mjs
    ```
+
    Access the dashboard at `http://localhost:3000`.
 
 ---

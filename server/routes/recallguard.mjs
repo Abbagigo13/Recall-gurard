@@ -1,5 +1,24 @@
 import { Router } from 'express'
-import { tatumFetch, tatumRpc, MissingApiKeyError, tatumGatewayUrl } from '../tatum-client.mjs'
+import {
+  buildResearchPlan,
+  rankMemories
+} from '../research-planner.mjs'
+import {
+  compareResearchEvidence
+} from '../evidence-comparison.mjs'
+import {
+  tatumFetch,
+  tatumRpc,
+  MissingApiKeyError,
+  tatumGatewayUrl
+} from '../tatum-client.mjs'
+
+import {
+  getSuiNetworkStatus,
+  getSuiServiceInfo,
+  getSuiCheckpoint,
+  getSuiObject
+} from '../sui-grpc-client.mjs'
 
 const router = Router()
 
@@ -151,79 +170,75 @@ let decisions = [...DEMO_DECISIONS]
 // --------------------------------------------------------------------------
 // 1. Health check & Integration Status Endpoint (/api/recallguard/health)
 // --------------------------------------------------------------------------
+
+    
 router.get('/health', async (_req, res) => {
   const hasTatumKey = Boolean(process.env.TATUM_API_KEY)
+
   const walrusPublisherUrl = DEFAULT_WALRUS_PUBLISHER
   const walrusAggregatorUrl = DEFAULT_WALRUS_AGGREGATOR
 
-  // Test Walrus Aggregator connectivity
+  // Non-mutating Walrus aggregator connectivity check
   let walrusAggregatorStatus = 'checking'
   let walrusAggregatorLatencyMs = null
+
   try {
-    const t0 = Date.now()
-    const aggRes = await fetch(`${walrusAggregatorUrl}/v1/blobs/nonexistent_test_probe`, {
-      method: 'GET',
-      signal: AbortSignal.timeout(6000)
-    })
-    walrusAggregatorLatencyMs = Date.now() - t0
-    // 404 is normal and confirms the service is alive and listening
-    walrusAggregatorStatus = (aggRes.status === 404 || aggRes.ok) ? 'reachable' : `http-${aggRes.status}`
-  } catch (err) {
-    walrusAggregatorStatus = `unreachable: ${err.message}`
+    const started = Date.now()
+
+    const response = await fetch(
+      `${walrusAggregatorUrl}/v1/blobs/nonexistent_test_probe`,
+      {
+        method: 'GET',
+        signal: AbortSignal.timeout(6000)
+      }
+    )
+
+    walrusAggregatorLatencyMs = Date.now() - started
+
+    walrusAggregatorStatus =
+      response.ok || response.status === 404
+        ? 'reachable'
+        : `http-${response.status}`
+  } catch {
+    walrusAggregatorStatus = 'unreachable'
   }
 
-  // Test Walrus Publisher connectivity
-  let walrusPublisherStatus = 'checking'
-  let walrusPublisherLatencyMs = null
-  try {
-    const t0 = Date.now()
-    const pubRes = await fetch(`${walrusPublisherUrl}/v1/blobs`, {
-      method: 'PUT',
-      body: 'probe',
-      signal: AbortSignal.timeout(6000)
-    })
-    walrusPublisherLatencyMs = Date.now() - t0
-    // 200 or 400 confirms endpoint is accepting HTTP requests
-    walrusPublisherStatus = pubRes.status === 200 || pubRes.status === 400 ? 'operational' : `http-${pubRes.status}`
-  } catch (err) {
-    walrusPublisherStatus = `unreachable: ${err.message}`
-  }
+  // Do not perform storage writes during health checks
+  const walrusPublisherStatus = 'not_checked'
+  const walrusPublisherLatencyMs = null
 
-  // Test Tatum Sui Gateway connectivity
-  let tatumRpcStatus = 'not_configured'
+  // Tatum Sui gRPC connectivity check
+  let tatumRpcStatus = hasTatumKey
+    ? 'checking'
+    : 'not_configured'
+
   let tatumRpcLatencyMs = null
   let tatumRpcDetails = null
 
   if (hasTatumKey) {
     try {
-      const t0 = Date.now()
-      const rpcRes = await tatumRpc('sui', {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'sui_getLatestCheckpointSequenceNumber',
-        params: []
-      }, 'mainnet')
-      tatumRpcLatencyMs = Date.now() - t0
+      const started = Date.now()
+      const result = await getSuiNetworkStatus('mainnet')
 
-      if (rpcRes.ok) {
-        const json = await rpcRes.json()
-        if (json.result) {
-          tatumRpcStatus = 'connected'
-          tatumRpcDetails = { latestCheckpoint: json.result }
-        } else {
-          tatumRpcStatus = 'rpc_error'
-          tatumRpcDetails = { error: json.error?.message || 'RPC returned error' }
-        }
-      } else {
-        tatumRpcStatus = `http_${rpcRes.status}`
-        tatumRpcDetails = { statusText: rpcRes.statusText }
+      tatumRpcLatencyMs = Date.now() - started
+      tatumRpcStatus = 'connected'
+
+      tatumRpcDetails = {
+        provider: result.provider,
+        network: result.network,
+        epoch: result.serviceInfo.epoch,
+        checkpointHeight: result.serviceInfo.checkpointHeight,
+        checkpointDigest: result.checkpoint.checkpoint?.digest,
+        evidenceStatus: 'retrieved_from_tatum',
+        cryptographicallyVerified: false
       }
-    } catch (err) {
-      if (err instanceof MissingApiKeyError) {
-        tatumRpcStatus = 'missing_key'
-      } else {
-        tatumRpcStatus = 'network_error'
-        tatumRpcDetails = { error: err.message }
+    } catch (error) {
+      tatumRpcStatus = error instanceof MissingApiKeyError
+        ? 'missing_key'
+        : 'network_error'
+
+      tatumRpcDetails = {
+        error: error.message
       }
     }
   }
@@ -231,14 +246,17 @@ router.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
+
     integrations: {
       tatumSuiRpc: {
         configured: hasTatumKey,
         status: tatumRpcStatus,
         latencyMs: tatumRpcLatencyMs,
         details: tatumRpcDetails,
-        gatewayHost: tatumGatewayUrl('sui', 'mainnet')
+        gatewayHost: 'https://sui-mainnet-grpc.gateway.tatum.io',
+        protocol: 'gRPC'
       },
+
       walrusMemory: {
         configured: true,
         publisherUrl: walrusPublisherUrl,
@@ -247,17 +265,25 @@ router.get('/health', async (_req, res) => {
         aggregatorUrl: walrusAggregatorUrl,
         aggregatorStatus: walrusAggregatorStatus,
         aggregatorLatencyMs: walrusAggregatorLatencyMs,
-        pythonPackage: 'memwal',
-        encoding: 'RedStuff 2D Reed-Solomon'
+        storageWriteTested: false
       }
     },
+
     counts: {
       totalSessions: sessions.length,
-      realSessions: sessions.filter(s => s.provenance === 'live_production').length,
-      demoSessions: sessions.filter(s => s.provenance === 'demo_seed').length,
+      realSessions: sessions.filter(
+        s => s.provenance === 'live_production'
+      ).length,
+      demoSessions: sessions.filter(
+        s => s.provenance === 'demo_seed'
+      ).length,
       totalMemories: memories.length,
-      realMemories: memories.filter(m => m.provenance === 'live_production').length,
-      demoMemories: memories.filter(m => m.provenance === 'demo_seed').length
+      realMemories: memories.filter(
+        m => m.provenance === 'live_production'
+      ).length,
+      demoMemories: memories.filter(
+        m => m.provenance === 'demo_seed'
+      ).length
     }
   })
 })
@@ -346,108 +372,226 @@ router.get('/sessions/:id', (req, res) => {
   res.json(session)
 })
 
+
+
 router.post('/sessions', async (req, res) => {
-  const { question } = req.body
-  if (!question || typeof question !== 'string') {
-    return res.status(400).json({ error: 'Question string is required' })
+  const { question, network = 'mainnet' } = req.body
+
+  if (!question || typeof question !== 'string' || !question.trim()) {
+    return res.status(400).json({
+      error: 'Question string is required'
+    })
   }
 
-  // 1. Semantic memory recall from stored memories
-  const queryWords = question.toLowerCase().split(/\s+/).filter(w => w.length > 3)
-  const matchedMemories = memories.filter(m => {
-    const haystack = `${m.title} ${m.content}`.toLowerCase()
-    return queryWords.some(w => haystack.includes(w))
-  })
-  const recalledMemoryIds = matchedMemories.map(m => m.id)
+  if (!['mainnet', 'testnet'].includes(network)) {
+    return res.status(400).json({
+      error: 'Network must be mainnet or testnet.'
+    })
+  }
 
-  // 2. Real Sui RPC verification via Tatum
+  const cleanQuestion = question.trim()
+
+  // 1. Build an explicit research plan.
+  const researchPlan = buildResearchPlan(cleanQuestion)
+
+  // 2. Recall and rank relevant memories.
+  // Recall is not independent fact verification.
+  const rankedMemories = rankMemories(
+    cleanQuestion,
+    memories.filter(memory => memory.status !== 'superseded')
+  )
+
+  const matchedMemories = rankedMemories.map(item => item.memory)
+  const recalledMemoryIds = matchedMemories.map(memory => memory.id)
+ 
+
+  // 3. Retrieve only the evidence requested by the research plan.
   let onChainSuiData = null
   let onChainError = null
-  let verifiedFactClaim = null
+  let observedCheckpointClaim = null
 
-  if (process.env.TATUM_API_KEY) {
-    try {
-      const rpcRes = await tatumRpc('sui', {
-        jsonrpc: '2.0',
-        id: Date.now(),
-        method: 'sui_getLatestCheckpointSequenceNumber',
-        params: []
-      }, 'mainnet')
+  if (researchPlan.requiresTatum) {
+    if (!process.env.TATUM_API_KEY) {
+      onChainError = 'TATUM_API_KEY not configured.'
+    } else {
+      try {
+        if (researchPlan.capability === 'sui_checkpoint_status') {
+          const result = await getSuiNetworkStatus(network)
+          const checkpoint = result.checkpoint?.checkpoint
 
-      if (rpcRes.ok) {
-        const json = await rpcRes.json()
-        if (json.result) {
-          onChainSuiData = json.result
-          verifiedFactClaim = {
-            id: `CLM-${Date.now().toString().slice(-4)}`,
-            text: `Verified live Sui Checkpoint #${json.result} via Tatum Gateway RPC.`,
-            type: 'verified_fact',
-            source: 'Tatum Sui RPC (sui_getLatestCheckpointSequenceNumber)',
-            verifiedAt: new Date().toISOString(),
-            details: { checkpointSequence: json.result, network: 'sui-mainnet' }
+          onChainSuiData = {
+            network: `sui-${network}`,
+            provider: result.provider,
+            operation: 'checkpoint_status',
+            checkpointSequence: result.checkpoint.sequenceNumber,
+            checkpointDigest: checkpoint?.digest || null,
+            epoch: result.serviceInfo.epoch,
+            retrievedAt: result.retrievedAt,
+            evidenceStatus: 'retrieved_from_tatum',
+            cryptographicallyVerified: false
           }
-        } else {
-          onChainError = json.error?.message || 'RPC returned error object'
+
+        } else if (researchPlan.capability === 'sui_object_lookup') {
+          const result = await getSuiObject(
+            network,
+            researchPlan.requestedObjectId
+          )
+
+          onChainSuiData = {
+            network: `sui-${network}`,
+            provider: 'Tatum Sui gRPC',
+            operation: 'object_lookup',
+            objectId: researchPlan.requestedObjectId,
+            object: result,
+            retrievedAt: new Date().toISOString(),
+            evidenceStatus: 'retrieved_from_tatum',
+            cryptographicallyVerified: false
+          }
+
+        } else if (
+          researchPlan.capability === 'sui_chain_identifier' ||
+          researchPlan.capability === 'sui_network_status'
+        ) {
+          const result = await getSuiServiceInfo(network)
+
+          onChainSuiData = {
+            network: `sui-${network}`,
+            provider: 'Tatum Sui gRPC',
+            operation: researchPlan.capability,
+            chainId: result.chainId ?? result.chainIdentifier ?? null,
+            serviceInfo: result,
+            retrievedAt: new Date().toISOString(),
+            evidenceStatus: 'retrieved_from_tatum',
+            cryptographicallyVerified: false
+          }
         }
-      } else {
-        onChainError = `Sui Gateway HTTP ${rpcRes.status}: ${rpcRes.statusText}`
+
+        if (onChainSuiData) {
+          observedCheckpointClaim = {
+            id: `CLM-${Date.now()}-CHAIN`,
+            text: `Retrieved ${researchPlan.capability} evidence from Tatum Sui gRPC on ${network}.`,
+            type: 'on_chain_observation',
+            source: 'Tatum Sui gRPC',
+            verifiedAt: onChainSuiData.retrievedAt,
+            details: {
+              operation: onChainSuiData.operation,
+              network: onChainSuiData.network,
+              evidenceStatus: 'retrieved_from_tatum',
+              cryptographicallyVerified: false
+            }
+          }
+        }
+      } catch (error) {
+        onChainError = error.message
       }
-    } catch (err) {
-      onChainError = err.message
     }
-  } else {
-    onChainError = 'TATUM_API_KEY not configured. Read-only verification was skipped.'
   }
 
+  // 4. Classify the evidence honestly.
   const claims = []
-  if (verifiedFactClaim) {
-    claims.push(verifiedFactClaim)
-  }
 
   claims.push({
-    id: `CLM-${Date.now().toString().slice(-3)}A`,
-    text: `Research target: "${question}"`,
-    type: 'ai_interpretation',
-    source: 'RecallGuard Epistemic Synthesizer'
+    id: `CLM-${Date.now()}-PLAN`,
+    text: `Research capability selected: ${researchPlan.capability}.`,
+    type: 'research_plan',
+    source: 'RecallGuard Deterministic Research Planner',
+    details: {
+      plannerVersion: researchPlan.plannerVersion,
+      evidenceSources: researchPlan.evidenceSources,
+      aiModelUsed: false
+    }
   })
 
-  if (matchedMemories.length > 0) {
+  if (observedCheckpointClaim) {
+    claims.push(observedCheckpointClaim)
+  }
+
+  if (onChainError) {
     claims.push({
-      id: `CLM-${Date.now().toString().slice(-3)}B`,
-      text: `Cross-referenced against stored memory ${matchedMemories[0].id} (${matchedMemories[0].title}).`,
-      type: 'verified_fact',
-      source: `Persistent Memory [${matchedMemories[0].id}]`,
-      verifiedAt: new Date().toISOString()
+      id: `CLM-${Date.now()}-ERR`,
+      text: `Requested Tatum evidence could not be retrieved: ${onChainError}`,
+      type: 'evidence_retrieval_error',
+      source: 'Tatum Sui gRPC'
     })
+  }
+
+  for (const memory of matchedMemories) {
+    claims.push({
+      id: `CLM-${Date.now()}-${claims.length}`,
+      text: `Recalled memory: ${memory.title}. This is previously stored information, not independent verification.`,
+      type: 'recalled_memory',
+      source: `Memory Index [${memory.id}]`,
+      details: {
+        memoryId: memory.id,
+        provenance: memory.provenance,
+        storageVerified: memory.storageVerified === true,
+        status: memory.status
+      }
+    })
+  }
+
+  if (matchedMemories.length === 0) {
+    claims.push({
+      id: `CLM-${Date.now()}-NONE`,
+      text: 'No matching stored memories were found in the local memory index.',
+      type: 'memory_search_result',
+      source: 'Local Memory Index'
+    })
+  }
+
+  if (!observedCheckpointClaim && !researchPlan.requiresTatum) {
+    claims.push({
+      id: `CLM-${Date.now()}-SCOPE`,
+      text: 'No configured external evidence connector currently supports this research capability.',
+      type: 'evidence_gap',
+      source: 'RecallGuard Evidence Planner'
+    })
+  }
+
+  // 5. Build a transparent research conclusion.
+  let conclusion
+
+  if (onChainSuiData) {
+    conclusion =
+      `Retrieved ${researchPlan.capability} evidence from Tatum Sui gRPC on ${network}. ` +
+      `${matchedMemories.length} relevant memories were recalled. ` +
+      'The retrieved metadata is not independently cryptographically verified.'
+  } else if (onChainError) {
+    conclusion =
+      `The research plan requested ${researchPlan.capability}, but Tatum evidence retrieval failed: ${onChainError}. ` +
+      `${matchedMemories.length} relevant memories were recalled.`
   } else {
-    claims.push({
-      id: `CLM-${Date.now().toString().slice(-3)}C`,
-      text: 'No prior matching memory vector found; initializing fresh research baseline.',
-      type: 'unverified_claim',
-      source: 'Exploratory Inquiry'
-    })
+    conclusion =
+      `Research scope analysis completed for: "${cleanQuestion}". ` +
+      `${matchedMemories.length} relevant memories were recalled. ` +
+      'No external evidence source was queried because this capability is not currently connected.'
   }
 
   const newSession = {
     id: `SES-LIVE-${Date.now().toString().slice(-6)}`,
     provenance: 'live_production',
-    question,
+    question: cleanQuestion,
     status: 'completed',
     createdAt: new Date().toISOString(),
-    confidence: verifiedFactClaim ? 0.96 : (matchedMemories.length > 0 ? 0.85 : 0.70),
+    confidence: null,
+    confidenceStatus: 'not_measured',
+    researchPlan,
+    onChainSuiData,
     recalledMemoryIds,
     claims,
-    conclusion: verifiedFactClaim
-      ? `Anchored inquiry to confirmed on-chain Sui Checkpoint #${verifiedFactClaim.details.checkpointSequence}. Synthesized with ${recalledMemoryIds.length} recalled memories.`
-      : `Synthesized inquiry using local memory index. Live on-chain anchoring: ${onChainError}.`,
-    learningDelta: recalledMemoryIds.length > 0
-      ? `Recalled knowledge vectors (${recalledMemoryIds.join(', ')}). Reinforcing stance consistency.`
-      : 'Initialized novel observation ready for Walrus storage.'
+    conclusion,
+    learningDelta: matchedMemories.length > 0
+      ? `Recalled ${matchedMemories.length} relevant memories: ${recalledMemoryIds.join(', ')}.`
+      : 'No matching local memories were found.'
   }
 
   sessions.unshift(newSession)
 
-  // 3. Store new session finding into Walrus Memory service
+
+  // 5. Attempt to store the session finding in Walrus.
+  
+
+    
   let walrusStoreResult = null
   let walrusStoreError = null
   let storedMemory = null
@@ -455,55 +599,168 @@ router.post('/sessions', async (req, res) => {
   try {
     const memoryPayload = JSON.stringify({
       sessionId: newSession.id,
-      question,
+      question: cleanQuestion,
       conclusion: newSession.conclusion,
       timestamp: newSession.createdAt,
-      verifiedCheckpoint: onChainSuiData
+      onChainObservation: onChainSuiData
     })
 
-    const pubRes = await fetch(`${DEFAULT_WALRUS_PUBLISHER}/v1/blobs?epochs=1`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: memoryPayload,
-      signal: AbortSignal.timeout(18000)
-    })
+    // 1. Publish the memory to Walrus.
+    const pubRes = await fetch(
+      `${DEFAULT_WALRUS_PUBLISHER}/v1/blobs?epochs=1`,
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: memoryPayload,
+        signal: AbortSignal.timeout(18000)
+      }
+    )
 
-    if (pubRes.ok) {
+    if (!pubRes.ok) {
+      walrusStoreError =
+        `Walrus publisher returned HTTP ${pubRes.status}`
+    } else {
       const pubData = await pubRes.json()
-      const blobId = pubData.newlyCreated?.blobObject?.blobId || pubData.alreadyCertified?.blobId
-      const suiObjectId = pubData.newlyCreated?.blobObject?.id || null
 
+      const blobId =
+        pubData.newlyCreated?.blobObject?.blobId ||
+        pubData.alreadyCertified?.blobId ||
+        null
+
+      const suiObjectId =
+        pubData.newlyCreated?.blobObject?.id || null
+
+      const aggregatorUrl = blobId
+        ? `${DEFAULT_WALRUS_AGGREGATOR}/v1/blobs/${blobId}`
+        : null
+
+      // 2. Verify the upload by reading it back.
+      let storageVerified = false
+      let storageStatus = 'write_accepted_unverified'
+      let readbackError = null
+      let readbackAttempts = 0
+
+      if (aggregatorUrl) {
+           const retryDelays = [500, 1000, 2000, 3000]
+    let lastReadbackError = null
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      readbackAttempts = attempt + 1
+      try {
+        const readbackRes = await fetch(aggregatorUrl, {
+          signal: AbortSignal.timeout(12000)
+        })
+
+        if (readbackRes.ok) {
+          const retrievedPayload = await readbackRes.text()
+
+          if (retrievedPayload === memoryPayload) {
+            storageVerified = true
+            storageStatus = 'verified_readback'
+            readbackError = null
+          } else {
+            readbackError =
+              'Retrieved blob does not exactly match the uploaded payload.'
+            storageStatus = 'readback_mismatch'
+          }
+
+          break
+        }
+
+        lastReadbackError =
+          `Walrus read-back returned HTTP ${readbackRes.status}`
+
+        if (
+          readbackRes.status !== 404 &&
+          readbackRes.status < 500
+        ) {
+          break
+        }
+      } catch (error) {
+        lastReadbackError =
+          `Walrus read-back failed: ${error.message}`
+      }
+
+      if (attempt < 4) {
+        await new Promise(resolve =>
+          setTimeout(resolve, retryDelays[attempt])
+        )
+      }
+    }
+
+    if (!storageVerified && storageStatus !== 'readback_mismatch') {
+      readbackError =
+        lastReadbackError || 'Walrus read-back failed after retries.'
+      storageStatus = 'readback_failed'
+    }
+      } else {
+        readbackError = 'Publisher response did not contain a blob ID.'
+        storageStatus = 'missing_blob_id'
+      }
+
+      // 3. Record the actual verification result.
       walrusStoreResult = {
         blobId,
         suiObjectId,
-        aggregatorUrl: `${DEFAULT_WALRUS_AGGREGATOR}/v1/blobs/${blobId}`,
+        aggregatorUrl,
+        readbackAttempts,
         cost: pubData.newlyCreated?.cost || null,
-        certifiedEpoch: pubData.newlyCreated?.blobObject?.registeredEpoch || null
+        certifiedEpoch:
+          pubData.newlyCreated?.blobObject?.registeredEpoch || null,
+        writeStatus: 'accepted',
+        storageVerified,
+        storageStatus,
+        readbackError
       }
+
+const sourceReferenceByCapability = {
+  sui_checkpoint_status: 'Tatum Sui gRPC checkpoint metadata',
+  sui_object_lookup: 'Tatum Sui gRPC object metadata',
+  sui_chain_identifier: 'Tatum Sui gRPC chain identifier',
+  sui_network_status: 'Tatum Sui gRPC network metadata',
+  memory_and_scope_analysis: 'RecallGuard Research Engine'
+}
+
+const sourceReference =
+  sourceReferenceByCapability[researchPlan.capability] ??
+  'RecallGuard Research Engine'
 
       storedMemory = {
         id: `MEM-LIVE-${Date.now().toString().slice(-6)}`,
         provenance: 'live_production',
-        category: verifiedFactClaim ? 'on_chain_fact' : 'epistemic_stance',
-        title: `Observation: ${question.slice(0, 45)}...`,
+        category: onChainSuiData
+          ? 'on_chain_observation'
+          : 'epistemic_stance',
+        title: `Observation: ${cleanQuestion.slice(0, 45)}...`,
         content: newSession.conclusion,
-        sourceReference: verifiedFactClaim ? 'Tatum Sui RPC + Walrus Memory' : 'RecallGuard Memory Engine',
+        sourceReference,
         walrusBlobId: blobId,
         walrusSuiObjectId: suiObjectId,
-        walrusAggregatorUrl: walrusStoreResult.aggregatorUrl,
+        walrusAggregatorUrl: aggregatorUrl,
         createdAt: new Date().toISOString(),
         status: 'active',
-        reliabilityScore: verifiedFactClaim ? 0.98 : 0.85,
-        storageVerified: true
+        reliabilityScore: null,
+        confidence: null,
+        confidenceStatus: 'not_measured',
+        storageVerified,
+        storageStatus
       }
+
       memories.unshift(storedMemory)
-    } else {
-      walrusStoreError = `Walrus publisher returned HTTP ${pubRes.status}`
+
+      if (!storageVerified) {
+        walrusStoreError = readbackError
+      }
     }
-  } catch (err) {
-    walrusStoreError = `Walrus publisher communication failed: ${err.message}`
+  } catch (error) {
+    walrusStoreError =
+      `Walrus publisher communication failed: ${error.message}`
   }
 
+        
+  // 6. Preserve the existing API response structure.
   res.status(201).json({
     session: newSession,
     storedMemory,
@@ -513,6 +770,7 @@ router.post('/sessions', async (req, res) => {
     onChainError
   })
 })
+
 
 // --------------------------------------------------------------------------
 // 4. Memory Explorer Endpoints (Walrus Store & Retrieve)
@@ -568,21 +826,26 @@ router.post('/memories', async (req, res) => {
     const blobId = pubData.newlyCreated?.blobObject?.blobId || pubData.alreadyCertified?.blobId
     const suiObjectId = pubData.newlyCreated?.blobObject?.id || null
 
-    const newMemory = {
-      id: `MEM-LIVE-${Date.now().toString().slice(-6)}`,
-      provenance: 'live_production',
-      category,
-      title,
-      content,
-      sourceReference,
-      walrusBlobId: blobId,
-      walrusSuiObjectId: suiObjectId,
-      walrusAggregatorUrl: `${DEFAULT_WALRUS_AGGREGATOR}/v1/blobs/${blobId}`,
-      createdAt: new Date().toISOString(),
-      status: 'active',
-      reliabilityScore: 0.95,
-      storageVerified: true
-    }
+    
+const newMemory = {
+  id: `MEM-LIVE-${Date.now().toString().slice(-6)}`,
+  provenance: 'live_production',
+  category,
+  title,
+  content,
+  sourceReference,
+  walrusBlobId: blobId,
+  walrusSuiObjectId: suiObjectId,
+  walrusAggregatorUrl: blobId
+    ? `${DEFAULT_WALRUS_AGGREGATOR}/v1/blobs/${blobId}`
+    : null,
+  createdAt: new Date().toISOString(),
+  status: 'active',
+  reliabilityScore: null,
+  storageVerified: false,
+  storageStatus: 'write_accepted_unverified'
+}
+
 
     memories.unshift(newMemory)
     res.status(201).json({
@@ -643,161 +906,229 @@ router.get('/memories/walrus/:blobId', async (req, res) => {
 // --------------------------------------------------------------------------
 // 5. Tatum Sui Direct RPC Query Verification endpoint (Read-Only)
 // --------------------------------------------------------------------------
-router.post('/sui/rpc', async (req, res) => {
-  const { method = 'sui_getChainIdentifier', params = [], network = 'mainnet' } = req.body
 
-  // Strict guard: read-only only
-  const disallowedPrefixes = ['unsafe_', 'sui_executeTransactionBlock', 'sui_dryRunTransactionBlock']
-  if (disallowedPrefixes.some(prefix => method.startsWith(prefix))) {
-    return res.status(403).json({
-      error: 'RecallGuard enforces read-only verification. Transaction signing or mutative RPCs are prohibited.',
+router.post('/sui/rpc', async (req, res) => {
+  const {
+    method = 'sui_getChainIdentifier',
+    params = [],
+    network = 'mainnet'
+  } = req.body || {}
+
+  // Only allow supported, read-only operations.
+  const supportedMethods = [
+    'sui_getLatestCheckpointSequenceNumber',
+    'sui_getChainIdentifier',
+    'sui_getObject'
+  ]
+
+  if (!supportedMethods.includes(method)) {
+    return res.status(501).json({
+      error: `Method "${method}" is not currently supported by the Tatum Sui gRPC integration.`,
+      supportedMethods,
+      isVerifiedFact: false,
+      evidenceStatus: 'unsupported_method'
+    })
+  }
+
+  if (!['mainnet', 'testnet'].includes(network)) {
+    return res.status(400).json({
+      error: 'Unsupported Sui network. Use mainnet or testnet.',
+      isVerifiedFact: false
+    })
+  }
+
+  if (!Array.isArray(params)) {
+    return res.status(400).json({
+      error: 'RPC params must be a JSON array.',
       isVerifiedFact: false
     })
   }
 
   if (!process.env.TATUM_API_KEY) {
     return res.status(503).json({
-      error: 'TATUM_API_KEY is not configured in workspace environment. Set TATUM_API_KEY to send live Sui queries.',
+      error: 'TATUM_API_KEY is not configured.',
       isVerifiedFact: false
     })
   }
 
-  const gatewayHost = tatumGatewayUrl('sui', network)
+  const startedAt = Date.now()
 
   try {
-    const response = await tatumRpc('sui', {
-      jsonrpc: '2.0',
-      id: Date.now(),
-      method,
-      params
-    }, network)
+    let result
+    let operation
 
-    const contentType = response.headers.get('content-type') || 'unknown'
-    const rawText = await response.text()
+    switch (method) {
+      case 'sui_getLatestCheckpointSequenceNumber': {
+        operation = 'LedgerService.GetServiceInfo'
 
-    let parsedBody = null
-    try {
-      parsedBody = JSON.parse(rawText)
-    } catch (_e) {
-      parsedBody = rawText
-    }
+        const info = await getSuiServiceInfo(network)
 
-    // Determine whether this is a genuine successful RPC answer or an error
-    const isSuccess = response.ok && parsedBody && typeof parsedBody === 'object' && ('result' in parsedBody)
+        result = String(info.checkpointHeight)
+        break
+      }
 
-    // Build diagnostic analysis if not successful
-    let diagnostics = null
-    if (!isSuccess) {
-      if (response.status === 404) {
-        diagnostics = {
-          issue: 'Gateway endpoint returned HTTP 404 Not Found',
-          endpointTested: gatewayHost,
-          officialDocServer: 'https://{sui-network}.gateway.tatum.io',
-          reason: 'The Tatum Sui gateway route is currently not enabled or routed on this API key plan. (In contrast, Tatum Ethereum and Polygon gateways respond with 200 OK using this key).',
-          resolution: 'Sui JSON-RPC requires an active Sui RPC gateway entitlement on the Tatum subscription plan. On-chain claims remain unverified.'
+      case 'sui_getChainIdentifier': {
+        operation = 'LedgerService.GetServiceInfo'
+
+        const info = await getSuiServiceInfo(network)
+
+        result = info.chainId
+        break
+      }
+
+      case 'sui_getObject': {
+        operation = 'LedgerService.GetObject'
+
+        const objectId = params[0]
+        const options = params[1] || {}
+
+        if (
+          typeof options !== 'object' ||
+          Array.isArray(options)
+        ) {
+          return res.status(400).json({
+            error: 'Object options must be a JSON object.',
+            isVerifiedFact: false
+          })
         }
-      } else if (response.status === 429) {
-        diagnostics = {
-          issue: 'Tatum rate limit exceeded (HTTP 429)',
-          reason: 'Plan concurrency limit reached (e.g. 3 requests/sec on Free tier). Back off before retrying.'
-        }
-      } else if (response.status === 401 || response.status === 403) {
-        diagnostics = {
-          issue: `Authentication failure (HTTP ${response.status})`,
-          reason: 'TATUM_API_KEY rejected or subscription inactive.'
-        }
+
+        const objectResponse = await getSuiObject(
+          network,
+          objectId,
+          options
+        )
+
+        result = objectResponse.object || null
+        break
       }
     }
 
-    res.status(response.ok ? 200 : response.status).json({
+    res.json({
       network: `sui-${network}`,
       method,
+      operation,
       params,
       timestamp: new Date().toISOString(),
-      provider: 'Tatum Managed Sui RPC Gateway',
-      gatewayUrl: gatewayHost,
-      httpStatus: response.status,
-      httpStatusText: response.statusText,
-      contentType,
-      isVerifiedFact: isSuccess,
-      response: parsedBody,
-      diagnostics
+      durationMs: Date.now() - startedAt,
+      provider: 'Tatum Sui gRPC',
+      protocol: 'gRPC',
+      status: 'success',
+      evidenceStatus: 'retrieved_from_tatum',
+      cryptographicallyVerified: false,
+      isVerifiedFact: false,
+      result
     })
   } catch (err) {
     if (err instanceof MissingApiKeyError) {
-      return res.status(503).json({ error: err.message, isVerifiedFact: false })
+      return res.status(503).json({
+        error: err.message,
+        isVerifiedFact: false
+      })
     }
+
     res.status(502).json({
-      error: 'Failed to communicate with Tatum Sui Gateway',
+      error: 'Sui gRPC request failed.',
       details: err.message,
-      gatewayUrl: gatewayHost,
+      network,
+      method,
+      provider: 'Tatum Sui gRPC',
+      protocol: 'gRPC',
+      durationMs: Date.now() - startedAt,
+      evidenceStatus: 'retrieval_failed',
+      cryptographicallyVerified: false,
       isVerifiedFact: false
     })
   }
 })
 
+
+
+
 // Detailed server-side diagnostics endpoint for Tatum Sui RPC
+
+
+// Detailed server-side diagnostics endpoint for Tatum Sui gRPC
 router.get('/sui/diagnostics', async (_req, res) => {
   const hasKey = Boolean(process.env.TATUM_API_KEY)
   const networks = ['mainnet', 'testnet']
-  const results = []
 
-  for (const net of networks) {
-    const gateway = tatumGatewayUrl('sui', net)
-    if (!hasKey) {
-      results.push({
-        network: net,
-        gateway,
-        status: 'no_api_key',
-        error: 'TATUM_API_KEY is not set'
-      })
-      continue
-    }
+  const apiBase = process.env.TATUM_API_BASE || 'https://api.tatum.io'
+  const domain = new URL(apiBase).hostname.replace(/^api\./, '')
 
-    try {
-      const t0 = Date.now()
-      const r = await tatumRpc('sui', {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'sui_getChainIdentifier',
-        params: []
-      }, net)
-      const durationMs = Date.now() - t0
-      const contentType = r.headers.get('content-type') || 'unknown'
-      const rawText = await r.text()
-      let parsed = null
-      try { parsed = JSON.parse(rawText) } catch (_e) { parsed = rawText }
+  const results = await Promise.all(
+    networks.map(async (net) => {
+      const gateway = `https://sui-${net}-grpc.gateway.${domain}`
 
-      results.push({
-        network: net,
-        gateway,
-        durationMs,
-        httpStatus: r.status,
-        httpStatusText: r.statusText,
-        contentType,
-        sanitizedBody: parsed,
-        isOperational: r.ok && parsed && typeof parsed === 'object' && ('result' in parsed)
-      })
-    } catch (err) {
-      results.push({
-        network: net,
-        gateway,
-        status: 'fetch_error',
-        error: err.message
-      })
-    }
-  }
+      if (!hasKey) {
+        return {
+          network: net,
+          gateway,
+          protocol: 'gRPC',
+          status: 'no_api_key',
+          isOperational: false,
+          error: 'TATUM_API_KEY is not set'
+        }
+      }
 
-  // Cross-reference with Tatum core Data API & other chains
+      try {
+        const startedAt = Date.now()
+        const networkStatus = await getSuiNetworkStatus(net)
+        const durationMs = Date.now() - startedAt
+
+        const serviceInfo = networkStatus.serviceInfo || {}
+        const checkpoint = networkStatus.checkpoint || {}
+
+        return {
+          network: net,
+          gateway,
+          protocol: 'gRPC',
+          provider: 'Tatum Sui gRPC',
+          durationMs,
+          status: 'connected',
+          isOperational: true,
+          chainIdentifier: serviceInfo.chainId || null,
+          epoch: serviceInfo.epoch || null,
+          checkpointHeight: serviceInfo.checkpointHeight || null,
+          latestCheckpoint: {
+            sequenceNumber: checkpoint.sequenceNumber || null,
+            digest: checkpoint.checkpoint?.digest || null
+          },
+          evidenceStatus: checkpoint.evidenceStatus,
+          cryptographicallyVerified: false,
+          retrievedAt: networkStatus.retrievedAt
+        }
+      } catch (err) {
+        return {
+          network: net,
+          gateway,
+          protocol: 'gRPC',
+          status: 'connection_failed',
+          isOperational: false,
+          error: err.message
+        }
+      }
+    })
+  )
+
+  // Cross-reference with Tatum core Data API and another chain.
   let suiPriceCheck = null
   let ethGatewayCheck = null
+
   if (hasKey) {
     try {
       const priceRes = await tatumFetch('/v3/tatum/rate/SUI?basePair=USD')
-      if (priceRes.ok) {
-        suiPriceCheck = await priceRes.json()
+
+      suiPriceCheck = {
+        status: priceRes.status,
+        ok: priceRes.ok,
+        data: priceRes.ok ? await priceRes.json() : null
       }
-    } catch (_e) {}
+    } catch (err) {
+      suiPriceCheck = {
+        ok: false,
+        error: err.message
+      }
+    }
 
     try {
       const ethRes = await tatumRpc('ethereum', {
@@ -806,12 +1137,22 @@ router.get('/sui/diagnostics', async (_req, res) => {
         method: 'web3_clientVersion',
         params: []
       }, 'mainnet')
+
       ethGatewayCheck = {
         status: ethRes.status,
         ok: ethRes.ok
       }
-    } catch (_e) {}
+    } catch (err) {
+      ethGatewayCheck = {
+        ok: false,
+        error: err.message
+      }
+    }
   }
+
+  const operationalNetworks = results.filter(
+    result => result.isOperational
+  ).map(result => result.network)
 
   res.json({
     timestamp: new Date().toISOString(),
@@ -822,12 +1163,16 @@ router.get('/sui/diagnostics', async (_req, res) => {
       ethereumGatewayWorking: ethGatewayCheck
     },
     rootCauseSummary: {
-      httpStatus: 404,
-      diagnosis: 'The Tatum Gateway domain https://sui-mainnet.gateway.tatum.io and https://sui-testnet.gateway.tatum.io respond with 404 {"statusCode": 404, "message": "Not Found"}. The API key is valid and functional on Tatum Data API (SUI price oracle: 200 OK) and Ethereum gateway (200 OK), but the Sui RPC interface is not active on this tier.',
-      verificationGuarantee: 'RecallGuard correctly marks all Sui RPC calls as unverified/failed, refusing to fabricate on-chain data.'
+      protocol: 'gRPC',
+      operationalNetworks,
+      diagnosis: operationalNetworks.length
+        ? `Tatum Sui gRPC connectivity is confirmed for: ${operationalNetworks.join(', ')}. Legacy Sui JSON-RPC HTTP 404 responses do not establish that the API key lacks Sui access.`
+        : 'Tatum Sui gRPC connectivity has not been confirmed. Review the individual network diagnostics.',
+      verificationGuarantee: 'Checkpoint metadata is retrieved from Tatum Sui gRPC. Retrieval alone does not independently establish cryptographic verification or prove the truth of a research claim.'
     }
   })
 })
+
 
 // --------------------------------------------------------------------------
 // 6. Learning Decisions & Audit Timeline

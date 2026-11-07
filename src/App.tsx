@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Brain,
   Shield,
@@ -29,7 +29,14 @@ import {
   Info,
   Check,
   Server,
-  Cloud
+  Cloud,
+  Sun,
+  Moon,
+  Menu,
+  X,
+  LayoutDashboard,
+  ShieldCheck,
+  History
 } from 'lucide-react';
 
 interface MetricBreakdown {
@@ -70,7 +77,8 @@ interface ResearchSession {
   question: string;
   status: string;
   createdAt: string;
-  confidence: number;
+  confidence: number | null;
+  confidenceStatus?: 'measured' | 'not_measured';
   recalledMemoryIds: string[];
   claims: Claim[];
   conclusion: string;
@@ -90,7 +98,7 @@ interface MemoryItem {
   createdAt: string;
   status: string;
   supersededBy?: string;
-  reliabilityScore: number;
+  reliabilityScore: number | null;
   storageVerified: boolean;
 }
 
@@ -114,7 +122,8 @@ interface TimelineItem {
   timestamp: string;
   title: string;
   subtitle: string;
-  confidence: number;
+  confidence: number | null;
+  confidenceStatus?: 'measured' | 'not_measured';
   details: string;
   recalledMemoryIds: string[];
 }
@@ -152,8 +161,32 @@ interface HealthData {
   };
 }
 
+function DashboardSkeleton() {
+  return (
+    <div className="skeleton-screen space-y-xl" role="status" aria-label="Loading RecallGuard dashboard">
+      <div className="skeleton-line skeleton-title" />
+      <div className="skeleton-line skeleton-subtitle" />
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-md">
+        {Array.from({ length: 4 }).map((_, index) => <div className="skeleton-card" key={index}><div className="skeleton-line w-1/2" /><div className="skeleton-line skeleton-number" /><div className="skeleton-line w-2/3" /></div>)}
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-md">
+        <div className="skeleton-card skeleton-panel" /><div className="skeleton-card skeleton-panel" />
+      </div>
+      <span className="sr-only">Loading dashboard data…</span>
+    </div>
+  );
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'workspace' | 'memories' | 'verification' | 'learning' | 'timeline' | 'sdk'>('dashboard');
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    if (typeof window === 'undefined') return 'light';
+    const saved = window.localStorage.getItem('recallguard-theme');
+    return saved === 'dark' ? 'dark' : 'light';
+  });
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   
   // Provenance filter: 'all' | 'live_production' | 'demo_seed'
   const [provenanceFilter, setProvenanceFilter] = useState<'all' | 'live_production' | 'demo_seed'>('all');
@@ -200,6 +233,111 @@ export default function App() {
   const [rpcResult, setRpcResult] = useState<any>(null);
   const [rpcError, setRpcError] = useState<string | null>(null);
 
+    // Dashboard analytics — derived from actual records.
+  const dashboardAnalytics = useMemo(() => {
+    const visibleSessions = sessions.filter(session =>
+      provenanceFilter === 'all' ||
+      session.provenance === provenanceFilter
+    );
+
+    const visibleMemories = memories.filter(memory =>
+      provenanceFilter === 'all' ||
+      memory.provenance === provenanceFilter
+    );
+
+    const visibleDecisions = decisions.filter(decision =>
+      provenanceFilter === 'all' ||
+      decision.provenance === provenanceFilter
+    );
+
+    const claims = visibleSessions.flatMap(session => session.claims);
+
+    const claimDistribution = [
+      {
+        label: 'Verified facts',
+        value: claims.filter(claim => claim.type === 'verified_fact').length
+      },
+      {
+        label: 'Unverified claims',
+        value: claims.filter(claim => claim.type === 'unverified_claim').length
+      },
+      {
+        label: 'AI interpretations',
+        value: claims.filter(claim => claim.type === 'ai_interpretation').length
+      },
+      {
+        label: 'Superseded claims',
+        value: claims.filter(claim => claim.type === 'superseded_claim').length
+      }
+    ];
+
+    const storageDistribution = [
+      {
+        label: 'Verified read-back',
+        value: visibleMemories.filter(memory => memory.storageVerified).length
+      },
+      {
+        label: 'Not verified',
+        value: visibleMemories.filter(memory => !memory.storageVerified).length
+      }
+    ];
+
+    const activityByDay = Array.from({ length: 7 }, (_, index) => {
+      const date = new Date();
+      date.setHours(0, 0, 0, 0);
+      date.setDate(date.getDate() - (6 - index));
+
+      const dayKey = date.toLocaleDateString();
+
+      return {
+        day: date.toLocaleDateString(undefined, { weekday: 'short' }),
+        sessions: visibleSessions.filter(session => {
+          const created = new Date(session.createdAt);
+          return !Number.isNaN(created.getTime()) &&
+            created.toLocaleDateString() === dayKey;
+        }).length
+      };
+    });
+
+    const revisionsByDay = activityByDay.map((day, index) => {
+      const date = new Date();
+      date.setHours(0, 0, 0, 0);
+      date.setDate(date.getDate() - (6 - index));
+
+      return {
+        day: day.day,
+        revisions: visibleDecisions.filter(decision => {
+          const timestamp = new Date(decision.timestamp);
+          return !Number.isNaN(timestamp.getTime()) &&
+            timestamp.toLocaleDateString() === date.toLocaleDateString();
+        }).length
+      };
+    });
+
+    return {
+      sessions: visibleSessions,
+      memories: visibleMemories,
+      decisions: visibleDecisions,
+      totalClaims: claims.length,
+      claimDistribution,
+      storageDistribution,
+      activityByDay,
+      revisionsByDay
+    };
+  }, [sessions, memories, decisions, provenanceFilter]);
+  // Apply and persist the selected theme. The generated design tokens already define both palettes.
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    window.localStorage.setItem('recallguard-theme', theme);
+  }, [theme]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 4200);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
   // Load telemetry & health status
   const loadTelemetry = async () => {
     try {
@@ -222,6 +360,9 @@ export default function App() {
       }
     } catch (e) {
       console.error('Failed to load initial telemetry:', e);
+      setToast({ type: 'error', message: 'Could not load dashboard data. Check that the RecallGuard server is running.' });
+    } finally {
+      setInitialLoading(false);
     }
   };
 
@@ -236,7 +377,11 @@ export default function App() {
   // Handle new research execution
   const handleExecuteResearch = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!researchQuery.trim()) return;
+    if (researchQuery.trim().length < 8) {
+      setResearchNotice('Please enter a more specific research question (at least 8 characters).');
+      setToast({ type: 'error', message: 'Research question is too short.' });
+      return;
+    }
 
     setIsExecuting(true);
     setResearchNotice(null);
@@ -256,6 +401,7 @@ export default function App() {
           setMemories(prev => [data.storedMemory, ...prev]);
         }
         setResearchResultData(data);
+        setToast({ type: 'success', message: 'Research session completed.' });
         if (data.walrusStoreResult?.blobId) {
           setResearchNotice(`Live session anchored to Walrus blob: ${data.walrusStoreResult.blobId}`);
         } else if (data.walrusStoreError) {
@@ -268,9 +414,11 @@ export default function App() {
         fetch('/api/recallguard/health').then(r => r.json()).then(setHealth);
       } else {
         setResearchNotice(data.error || 'Failed to complete research session.');
+        setToast({ type: 'error', message: data.error || 'Research request failed.' });
       }
     } catch (err: any) {
       setResearchNotice(err.message || 'Network error executing research session');
+      setToast({ type: 'error', message: err.message || 'Network error executing research session.' });
     } finally {
       setIsExecuting(false);
     }
@@ -279,7 +427,11 @@ export default function App() {
   // Handle real Walrus memory commit
   const handleCreateMemory = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newMemTitle.trim() || !newMemContent.trim()) return;
+    if (newMemTitle.trim().length < 3 || newMemContent.trim().length < 10) {
+      setMemoryStoreStatusMsg({ type: 'error', text: 'Enter a title (at least 3 characters) and content (at least 10 characters).' });
+      setToast({ type: 'error', message: 'Please complete the memory fields.' });
+      return;
+    }
 
     setMemoryStoreLoading(true);
     setMemoryStoreStatusMsg(null);
@@ -298,6 +450,7 @@ export default function App() {
       const data = await res.json();
       if (res.ok && data.success) {
         setMemories(prev => [data.memory, ...prev]);
+        setToast({ type: 'success', message: 'Memory stored successfully.' });
         setMemoryStoreStatusMsg({
           type: 'success',
           text: `Memory confirmed written to Walrus storage (Blob: ${data.memory.walrusBlobId})`
@@ -311,12 +464,14 @@ export default function App() {
           type: 'error',
           text: data.error || data.details || 'Walrus rejected memory write request.'
         });
+        setToast({ type: 'error', message: data.error || 'Walrus rejected the memory write.' });
       }
     } catch (err: any) {
       setMemoryStoreStatusMsg({
         type: 'error',
         text: `Network failure connecting to Walrus publisher: ${err.message}`
       });
+      setToast({ type: 'error', message: err.message || 'Network failure connecting to Walrus.' });
     } finally {
       setMemoryStoreLoading(false);
     }
@@ -350,6 +505,7 @@ export default function App() {
       parsedParams = JSON.parse(rpcParamsJson);
     } catch (e) {
       setRpcError('Invalid JSON format in RPC parameters array.');
+      setToast({ type: 'error', message: 'RPC parameters must be valid JSON.' });
       setRpcLoading(false);
       return;
     }
@@ -367,8 +523,10 @@ export default function App() {
       const data = await res.json();
       if (res.ok) {
         setRpcResult(data);
+        setToast({ type: 'success', message: 'RPC request completed.' });
       } else {
         setRpcError(data.error || data.details || 'RPC query error');
+        setToast({ type: 'error', message: data.error || 'RPC query failed.' });
       }
     } catch (err: any) {
       setRpcError(err.message || 'Network request failed');
@@ -390,16 +548,35 @@ export default function App() {
       m.id.toLowerCase().includes(memorySearch.toLowerCase());
     return matchesProvenance && matchesCategory && matchesSearch;
   });
-
+const selectedRecalledMemories = selectedSession
+  ? selectedSession.recalledMemoryIds
+      .map(memId => memories.find(m => m.id === memId))
+      .filter((mem): mem is MemoryItem =>
+        Boolean(
+          mem &&
+          (provenanceFilter === 'all' ||
+            mem.provenance === provenanceFilter)
+        )
+      )
+  : [];
   const filteredTimeline = timeline.filter(t => {
     return provenanceFilter === 'all' || t.provenance === provenanceFilter;
   });
+  useEffect(() => {
+  const selectionIsVisible =
+    selectedSession &&
+    filteredSessions.some(s => s.id === selectedSession.id);
+
+  if (!selectionIsVisible) {
+    setSelectedSession(filteredSessions[0] ?? null);
+  }
+}, [provenanceFilter, sessions]);
 
   return (
     <div className="min-h-screen bg-primary text-primary font-sans flex flex-col">
       {/* Top Header */}
-      <header className="border-b border-secondary bg-primary px-xl py-md sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto flex items-center justify-between">
+      <header className="app-header border-b border-secondary bg-primary px-xl py-md sticky top-0 z-50">
+        <div className="w-full max-w-none mx-0 flex items-center justify-between gap-md">
           <div className="flex items-center gap-md">
             <span className="flex size-10 items-center justify-center rounded-full bg-secondary">
               <Shield className="size-5 shrink-0 text-fg-secondary" aria-hidden="true" />
@@ -416,77 +593,132 @@ export default function App() {
           </div>
 
           {/* Integration Live Status Badges */}
-          <div className="flex items-center gap-sm">
-            {/* Walrus Integration status badge */}
+          <div className="header-actions flex items-center gap-sm">
+            <button type="button" onClick={() => setTheme(current => current === 'dark' ? 'light' : 'dark')} className="theme-toggle" aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>
+              {theme === 'dark' ? <Sun className="size-4" aria-hidden="true" /> : <Moon className="size-4" aria-hidden="true" />}
+              <span className="theme-toggle-label">{theme === 'dark' ? 'Light' : 'Dark'}</span>
+            </button>
+            <button type="button" className="mobile-menu-toggle" onClick={() => setMobileNavOpen(open => !open)} aria-expanded={mobileNavOpen} aria-label={mobileNavOpen ? 'Close navigation' : 'Open navigation'}>
+              {mobileNavOpen ? <X className="size-5" /> : <Menu className="size-5" />}
+            </button>
+            
+            {/* Walrus Publisher Status */}
             <span className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium ${
               health?.integrations.walrusMemory.publisherStatus === 'operational'
                 ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
                 : 'border-utility-warning-200 bg-utility-warning-50 text-utility-warning-700'
             }`}>
-              <span className={`size-2 rounded-full ${
-                health?.integrations.walrusMemory.publisherStatus === 'operational' ? 'bg-success-primary' : 'bg-warning-primary'
-              }`} />
-              Walrus: {health?.integrations.walrusMemory.publisherStatus || 'checking'}
+              <span className="size-2 rounded-full bg-warning-primary" />
+              Publisher: {
+                health?.integrations.walrusMemory.publisherStatus === 'operational'
+                  ? 'Operational'
+                  : health?.integrations.walrusMemory.publisherStatus === 'not_checked'
+                    ? 'Not checked'
+                    : 'Checking'
+              }
             </span>
 
-            {/* Tatum Sui RPC status badge */}
+            {/* Walrus Aggregator Status */}
             <span className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium ${
-              health?.integrations.tatumSuiRpc.status === 'connected'
+              health?.integrations.walrusMemory.aggregatorStatus === 'reachable'
                 ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
-                : 'border-utility-gray-200 bg-utility-gray-50 text-utility-gray-700'
+                : 'border-utility-error-200 bg-utility-error-50 text-utility-error-700'
             }`}>
               <span className={`size-2 rounded-full ${
-                health?.integrations.tatumSuiRpc.status === 'connected' ? 'bg-success-primary' : 'bg-utility-gray-500'
+                health?.integrations.walrusMemory.aggregatorStatus === 'reachable'
+                  ? 'bg-success-primary'
+                  : 'bg-error-primary'
               }`} />
-              Tatum Sui: {health?.integrations.tatumSuiRpc.status || 'configured'}
+              Aggregator: {
+                health?.integrations.walrusMemory.aggregatorStatus === 'reachable'
+                  ? 'Reachable'
+                  : health?.integrations.walrusMemory.aggregatorStatus === 'checking'
+                    ? 'Checking'
+                    : health?.integrations.walrusMemory.aggregatorStatus || 'Unknown'
+              }
             </span>
           </div>
         </div>
 
-        {/* Tab navigation strip */}
-        <div className="max-w-7xl mx-auto mt-md flex items-center justify-between border-b border-secondary">
-          <div className="flex gap-lg">
-            {[
-              { id: 'dashboard', label: 'Dashboard' },
-              { id: 'workspace', label: 'Research Workspace' },
-              { id: 'memories', label: 'Memory Explorer' },
-              { id: 'verification', label: 'Evidence Verification' },
-              { id: 'learning', label: 'Learning Engine' },
-              { id: 'timeline', label: 'Audit Timeline' },
-              { id: 'sdk', label: 'memwal SDK' }
-            ].map(tab => (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id as any)}
-                className={`border-b-2 px-md py-sm text-sm font-semibold transition-colors focus-visible:ring-2 focus-visible:ring-focus-ring ${
-                  activeTab === tab.id
-                    ? 'border-brand text-brand-primary'
-                    : 'border-transparent text-tertiary hover:text-secondary'
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Global Data Provenance Filter */}
-          <div className="flex items-center gap-xs pb-xxs text-xs">
-            <span className="text-quaternary font-medium">Data View:</span>
-            <select
-              value={provenanceFilter}
-              onChange={e => setProvenanceFilter(e.target.value as any)}
-              className="rounded-md bg-primary px-sm py-xxs text-xs text-primary border border-primary focus-visible:ring-2 focus-visible:ring-focus-ring"
-            >
-              <option value="all">All (Real + Labeled Demo)</option>
-              <option value="live_production">Live Confirmed Only</option>
-              <option value="demo_seed">Demo Historical Seeds</option>
-            </select>
-          </div>
-        </div>
+        
       </header>
+{/* RIGHT SIDEBAR NAVIGATION */}
+<aside className="fixed right-0 top-20 bottom-0 z-40 w-64 border-l border-secondary bg-primary p-md overflow-y-auto hidden lg:block">
+  <div className="space-y-lg">
 
+    <div>
+      <p className="px-sm mb-sm text-xs font-semibold uppercase tracking-wider text-tertiary">
+        Workspace
+      </p>
+
+      <nav className="space-y-1">
+        {[
+          { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+          { id: 'workspace', label: 'Research Workspace', icon: Search },
+          { id: 'memories', label: 'Memory Explorer', icon: Database },
+          { id: 'verification', label: 'Evidence Verification', icon: ShieldCheck },
+          { id: 'learning', label: 'Learning Engine', icon: Brain },
+          { id: 'timeline', label: 'Audit Timeline', icon: History },
+          { id: 'sdk', label: 'memwal SDK', icon: Code2 }
+        ].map(tab => {
+          const Icon = tab.icon;
+
+          return (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id as any)}
+              className={`w-full flex items-center gap-sm rounded-lg px-md py-sm text-sm font-medium transition-colors ${
+                activeTab === tab.id
+                  ? 'bg-brand-primary/10 text-brand-primary border border-brand-primary/20'
+                  : 'text-tertiary hover:text-primary hover:bg-secondary'
+              }`}
+            >
+              <Icon className="size-4 shrink-0" />
+              {tab.label}
+            </button>
+          );
+        })}
+      </nav>
+    </div>
+
+    <div className="border-t border-secondary pt-lg">
+      <p className="px-sm mb-sm text-xs font-semibold uppercase tracking-wider text-tertiary">
+        Data Provenance
+      </p>
+
+      <label className="block px-sm mb-xs text-xs text-secondary">
+        Display records
+      </label>
+
+      <select
+        value={provenanceFilter}
+        onChange={e => setProvenanceFilter(e.target.value as any)}
+        className="w-full rounded-lg bg-secondary border border-primary px-sm py-sm text-xs text-primary"
+      >
+        <option value="all">All records</option>
+        <option value="live_production">Live Confirmed Only</option>
+        <option value="demo_seed">Demo Historical Seeds</option>
+      </select>
+    </div>
+
+    <div className="border-t border-secondary pt-lg">
+      <p className="px-sm text-xs text-tertiary">
+        RecallGuard Research Engine
+      </p>
+      <p className="px-sm mt-xs text-xs text-quaternary">
+        Tatum × Walrus Infrastructure
+      </p>
+    </div>
+
+  </div>
+</aside>
       {/* Main Content Area */}
-      <main className="flex-1 max-w-7xl mx-auto w-full p-xl space-y-xl">
+      <main
+  id="main-content"
+  className="app-main flex-1 w-full max-w-none p-xl pr-72 space-y-xl"
+>
+        {initialLoading && <DashboardSkeleton />}
+        {!initialLoading && <>
         {/* TAB 1: DASHBOARD */}
         {activeTab === 'dashboard' && (
           <div className="space-y-xl">
@@ -506,20 +738,64 @@ export default function App() {
               </button>
             </div>
 
+           
             {/* Backend Health Callout Bar */}
-            <div className="rounded-xl border border-secondary bg-primary p-lg shadow-xs flex items-center justify-between flex-wrap gap-md">
-              <div className="flex items-center gap-md">
+            <div className="rounded-xl border border-secondary bg-primary p-lg shadow-xs space-y-md">
+
+              <div className="flex items-center gap-sm">
                 <Server className="size-5 shrink-0 text-fg-brand-primary" />
-                <div className="text-xs">
-                  <span className="font-semibold text-primary block">Integration Health Status</span>
-                  <span className="text-tertiary">
-                    Walrus Publisher: <strong className="text-secondary">{health?.integrations.walrusMemory.publisherUrl}</strong> ({health?.integrations.walrusMemory.publisherStatus})
-                    &nbsp;•&nbsp;
-                    Walrus Aggregator: <strong className="text-secondary">{health?.integrations.walrusMemory.aggregatorUrl}</strong>
+                <span className="font-semibold text-primary text-sm">
+                  Integration Health Status
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-md">
+
+                {/* Publisher */}
+                <div className="rounded-lg bg-secondary p-md space-y-xs">
+                  <p className="text-xs font-semibold text-primary">
+                    Walrus Publisher
+                  </p>
+                  <p className="text-xs text-secondary font-mono break-all">
+                    {health?.integrations.walrusMemory.publisherUrl || 'Not configured'}
+                  </p>
+                  <span className="text-xs text-utility-warning-700">
+                    Status: {
+                      health?.integrations.walrusMemory.publisherStatus === 'operational'
+                        ? 'Operational'
+                        : health?.integrations.walrusMemory.publisherStatus === 'not_checked'
+                          ? 'Not checked — no write test performed'
+                          : health?.integrations.walrusMemory.publisherStatus || 'Unknown'
+                    }
                   </span>
                 </div>
+
+                {/* Aggregator */}
+                <div className="rounded-lg bg-secondary p-md space-y-xs">
+                  <p className="text-xs font-semibold text-primary">
+                    Walrus Aggregator
+                  </p>
+                  <p className="text-xs text-secondary font-mono break-all">
+                    {health?.integrations.walrusMemory.aggregatorUrl || 'Not configured'}
+                  </p>
+                  <div className="flex flex-wrap items-center gap-sm">
+                    <span className={`text-xs font-medium ${
+                      health?.integrations.walrusMemory.aggregatorStatus === 'reachable'
+                        ? 'text-utility-success-700'
+                        : 'text-utility-error-700'
+                    }`}>
+                      Status: {health?.integrations.walrusMemory.aggregatorStatus || 'Unknown'}
+                    </span>
+                    <span className="text-xs text-tertiary">
+                      {health?.integrations.walrusMemory.aggregatorLatencyMs != null
+                        ? `${health.integrations.walrusMemory.aggregatorLatencyMs} ms`
+                        : 'Latency unavailable'}
+                    </span>
+                  </div>
+                </div>
               </div>
-              <div className="flex items-center gap-xs">
+
+              <div className="flex flex-wrap items-center gap-xs">
                 <span className="inline-flex items-center gap-xs rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
                   {health?.counts.realMemories ?? 0} Live Verified Memories
                 </span>
@@ -582,22 +858,256 @@ export default function App() {
               </section>
 
               <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs">
-                <div className="flex items-center justify-between text-tertiary mb-xs">
-                  <p className="text-sm text-tertiary">Measured Accuracy</p>
-                  <Award className="size-4 shrink-0 text-fg-brand-primary" />
-                </div>
-                <p className="mt-md text-heading-xs font-semibold text-primary">
-                  {provenanceFilter === 'live_production'
-                    ? (metrics?.real.accuracyScore !== null ? `${metrics?.real.accuracyScore}%` : 'N/A (Pending Live Data)')
-                    : (metrics?.aggregated.accuracyScore !== null ? `${metrics?.aggregated.accuracyScore}%` : 'N/A')}
-                </p>
-                <p className="text-xs text-secondary mt-xs">
-                  {metrics?.real.accuracyScore !== null
-                    ? 'Calculated from live evaluated outcomes'
-                    : 'Requires evaluated production outcomes'}
-                </p>
-              </section>
+  <div className="flex items-center justify-between text-tertiary mb-xs">
+    <p className="text-sm text-tertiary">Verified Facts</p>
+    <ShieldCheck className="size-4 shrink-0 text-fg-brand-primary" />
+  </div>
+
+  <p className="mt-md text-heading-xs font-semibold text-primary">
+    {dashboardAnalytics.claimDistribution[0].value}
+  </p>
+
+  <p className="text-xs text-secondary mt-xs">
+    {dashboardAnalytics.claimDistribution[1].value} unverified,{' '}
+    {dashboardAnalytics.claimDistribution[3].value} superseded
+  </p>
+</section>
             </div>
+
+            
+            {/* RESEARCH ANALYTICS */}
+            <section className="space-y-lg">
+              <div className="flex flex-wrap items-center justify-between gap-sm">
+                <div>
+                  <h2 className="text-heading-sm font-semibold text-primary">
+                    Research Intelligence
+                  </h2>
+                  <p className="text-xs text-tertiary mt-xs">
+                    Analytics derived from {dashboardAnalytics.sessions.length} visible research sessions
+                  </p>
+                </div>
+                <span className="text-xs text-tertiary rounded-full border border-secondary px-md py-xs">
+                  {provenanceFilter === 'all'
+                    ? 'All provenance'
+                    : provenanceFilter === 'live_production'
+                      ? 'Live production'
+                      : 'Demo historical seeds'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-xl">
+
+                {/* RESEARCH ACTIVITY */}
+                <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs space-y-lg">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold text-primary">
+                        Research Activity
+                      </h3>
+                      <p className="text-xs text-tertiary mt-xs">
+                        Sessions created over the last 7 days
+                      </p>
+                    </div>
+                    <Activity className="size-5 text-fg-brand-primary" />
+                  </div>
+
+                  <div className="flex items-end justify-between gap-sm h-36">
+                    {dashboardAnalytics.activityByDay.map((item, index) => {
+                      const maximum = Math.max(
+                        ...dashboardAnalytics.activityByDay.map(day => day.sessions),
+                        1
+                      );
+                      const height = item.sessions > 0
+                        ? Math.max((item.sessions / maximum) * 100, 8)
+                        : 2;
+
+                      return (
+                        <div key={`${item.day}-${index}`} className="flex-1 flex flex-col items-center justify-end gap-sm h-full">
+                          <span className="text-xs text-secondary">
+                            {item.sessions}
+                          </span>
+                          <div className="w-full flex items-end justify-center flex-1">
+                            <div
+                              className="w-full max-w-10 rounded-t-md transition-all"
+                              style={{
+                                height: `${height}%`,
+                                backgroundColor: 'var(--color-bg-brand-solid)'
+                              }}
+                              title={`${item.sessions} sessions`}
+                            />
+                          </div>
+                          <span className="text-xs text-tertiary">
+                            {item.day}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {dashboardAnalytics.sessions.length === 0 && (
+                    <p className="text-xs text-tertiary text-center">
+                      No research sessions available for this filter.
+                    </p>
+                  )}
+                </section>
+
+                {/* CLAIM DISTRIBUTION */}
+                <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs space-y-lg">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold text-primary">
+                        Claim Distribution
+                      </h3>
+                      <p className="text-xs text-tertiary mt-xs">
+                        Classification across visible research sessions
+                      </p>
+                    </div>
+                    <ShieldCheck className="size-5 text-fg-brand-primary" />
+                  </div>
+
+                  <div className="space-y-lg">
+                    {dashboardAnalytics.claimDistribution.map(item => {
+                      const maximum = Math.max(
+                        ...dashboardAnalytics.claimDistribution.map(claim => claim.value),
+                        1
+                      );
+                      const percentage = (item.value / maximum) * 100;
+
+                      return (
+                        <div key={item.label} className="space-y-xs">
+                          <div className="flex items-center justify-between gap-sm">
+                            <span className="text-xs text-secondary">
+                              {item.label}
+                            </span>
+                            <span className="text-xs font-semibold text-primary tabular-nums">
+                              {item.value}
+                            </span>
+                          </div>
+                          <div className="h-2 rounded-full bg-secondary overflow-hidden">
+                            <div
+                              className="h-full rounded-full transition-all"
+                              style={{
+                                width: `${percentage}%`,
+                                backgroundColor: 'var(--color-bg-brand-solid)'
+                              }}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <p className="text-xs text-tertiary">
+                    {dashboardAnalytics.totalClaims} total classified claims. Classification does not independently establish correctness.
+                  </p>
+                </section>
+
+                {/* WALRUS MEMORY STORAGE */}
+                <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs space-y-lg">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold text-primary">
+                        Memory Storage Integrity
+                      </h3>
+                      <p className="text-xs text-tertiary mt-xs">
+                        Recorded memory read-back status
+                      </p>
+                    </div>
+                    <Database className="size-5 text-fg-brand-primary" />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-md">
+                    {dashboardAnalytics.storageDistribution.map(item => (
+                      <div key={item.label} className="rounded-lg bg-secondary p-md">
+                        <p className="text-xs text-tertiary">
+                          {item.label}
+                        </p>
+                        <p className="mt-sm text-heading-sm font-semibold text-primary tabular-nums">
+                          {item.value}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="h-3 flex rounded-full overflow-hidden bg-secondary">
+                    {dashboardAnalytics.memories.length > 0 && (
+                      <>
+                        <div
+                          className="h-full"
+                          style={{
+                            width: `${(dashboardAnalytics.storageDistribution[0].value / dashboardAnalytics.memories.length) * 100}%`,
+                            backgroundColor: 'var(--color-fg-success-primary)'
+                          }}
+                        />
+                        <div
+                          className="h-full"
+                          style={{
+                            width: `${(dashboardAnalytics.storageDistribution[1].value / dashboardAnalytics.memories.length) * 100}%`,
+                            backgroundColor: 'var(--color-fg-warning-primary)'
+                          }}
+                        />
+                      </>
+                    )}
+                  </div>
+
+                  <p className="text-xs text-tertiary">
+                    {dashboardAnalytics.memories.length} visible memory records. Read-back status is not a claim-level cryptographic verification.
+                  </p>
+                </section>
+
+                {/* BELIEF REVISION ACTIVITY */}
+                <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs space-y-lg">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold text-primary">
+                        Belief Revision Activity
+                      </h3>
+                      <p className="text-xs text-tertiary mt-xs">
+                        Recorded decision updates over the last 7 days
+                      </p>
+                    </div>
+                    <History className="size-5 text-fg-brand-primary" />
+                  </div>
+
+                  <div className="flex items-end justify-between gap-sm h-36">
+                    {dashboardAnalytics.revisionsByDay.map((item, index) => {
+                      const maximum = Math.max(
+                        ...dashboardAnalytics.revisionsByDay.map(day => day.revisions),
+                        1
+                      );
+                      const height = item.revisions > 0
+                        ? Math.max((item.revisions / maximum) * 100, 8)
+                        : 2;
+
+                      return (
+                        <div key={`${item.day}-${index}`} className="flex-1 flex flex-col items-center justify-end gap-sm h-full">
+                          <span className="text-xs text-secondary">
+                            {item.revisions}
+                          </span>
+                          <div className="w-full flex items-end justify-center flex-1">
+                            <div
+                              className="w-full max-w-10 rounded-t-md transition-all"
+                              style={{
+                                height: `${height}%`,
+                                backgroundColor: 'var(--color-fg-success-primary)'
+                              }}
+                              title={`${item.revisions} revisions`}
+                            />
+                          </div>
+                          <span className="text-xs text-tertiary">
+                            {item.day}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <p className="text-xs text-tertiary">
+                    {dashboardAnalytics.decisions.length} visible decision records in total.
+                  </p>
+                </section>
+              </div>
+            </section>
 
             {/* Split layout: Recent Sessions and Learning Engine */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-xl">
@@ -642,7 +1152,9 @@ export default function App() {
                       <h3 className="text-sm font-medium text-primary line-clamp-1">{s.question}</h3>
                       <div className="flex items-center gap-xs flex-wrap">
                         <span className="inline-flex items-center gap-xs rounded-full border border-utility-success-200 bg-utility-success-50 px-md py-xxs text-xs font-medium text-utility-success-700">
-                          Confidence: {Math.round(s.confidence * 100)}%
+                          Confidence: {s.confidenceStatus === 'not_measured' || s.confidence === null
+  ? 'Not measured'
+  : `${Math.round(s.confidence * 100)}%`}
                         </span>
                         {s.recalledMemoryIds.length > 0 && (
                           <span className="inline-flex items-center gap-xs rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
@@ -675,41 +1187,119 @@ export default function App() {
                   </button>
                 </div>
 
+                
+                    
                 <div className="space-y-md">
-                  <div className="p-md rounded-md bg-secondary border border-secondary space-y-xs">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-semibold text-primary">Empirical Belief Revision Process</span>
-                      <span className="text-sm font-mono text-tertiary">Active</span>
-                    </div>
-                    <div className="h-2 w-full overflow-hidden rounded-full bg-tertiary">
-                      <div className="h-full w-[80%] rounded-full bg-brand-solid" />
-                    </div>
-                    <p className="text-xs text-tertiary mt-xs">
-                      Agent revises conclusions systematically when on-chain Sui evidence contradicts earlier web claims.
-                    </p>
-                  </div>
 
-                  <div className="p-md rounded-md bg-secondary border border-secondary space-y-xs">
+                  {/* ACTUAL REVISION METRICS */}
+                  <div className="p-md rounded-md bg-secondary border border-secondary space-y-sm">
                     <div className="flex items-center justify-between">
-                      <span className="text-xs font-semibold text-primary">Latest Epistemic Correction</span>
-                      <span className="inline-flex items-center gap-xs rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
-                        DEC-004
+                      <span className="text-xs font-semibold text-primary">
+                        Recorded Belief Revisions
+                      </span>
+                      <span className="text-heading-sm font-semibold text-primary">
+                        {dashboardAnalytics.decisions.length}
                       </span>
                     </div>
-                    <p className="text-xs text-secondary leading-relaxed">
-                      "In Session #009, agent concluded Walrus testnet nodes required 5,000 SUI stake. In Session #011, fresh on-chain contract state retrieved through Tatum Sui RPC showed minimum threshold is 10,000 SUI. Agent marked prior claim as superseded."
+                    <p className="text-xs text-tertiary">
+                      Decision records currently available for the selected provenance filter.
                     </p>
                   </div>
 
-                  <div className="p-md rounded-md bg-secondary border border-secondary space-y-xs">
-                    <span className="text-xs font-semibold text-primary">Walrus Persistent Storage Layer</span>
-                    <div className="flex items-center justify-between text-xs text-secondary">
-                      <span>Publisher Endpoint:</span>
-                      <span className="font-mono text-tertiary">{health?.integrations.walrusMemory.publisherUrl}</span>
-                    </div>
-                    <div className="flex items-center justify-between text-xs text-secondary">
-                      <span>Redundancy Codec:</span>
-                      <span className="text-utility-success-700 font-medium">3f + 1 Reed-Solomon</span>
+                  {/* ACTUAL DECISION HISTORY */}
+                  <div className="space-y-sm">
+                    <span className="text-xs font-semibold text-primary">
+                      Recent Revision Records
+                    </span>
+
+                    {dashboardAnalytics.decisions.slice(0, 2).map(decision => (
+                      <div
+                        key={decision.id}
+                        className="p-md rounded-md bg-secondary border border-secondary space-y-sm"
+                      >
+                        
+<div className="flex items-center justify-between gap-sm flex-wrap">
+  <span className="text-xs font-semibold text-primary">
+    {decision.topic}
+  </span>
+
+  <div className="flex items-center gap-sm">
+    <span className={`rounded-full border px-sm py-xxs text-xs font-medium ${
+      decision.provenance === 'live_production'
+        ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
+        : 'border-utility-gray-200 bg-utility-gray-50 text-utility-gray-700'
+    }`}>
+      {decision.provenance === 'live_production'
+        ? 'Live production'
+        : 'Demo seed'}
+    </span>
+
+    <span className="text-xs text-tertiary font-mono">
+      {decision.id}
+    </span>
+  </div>
+</div>
+
+                        <div className="space-y-xs text-xs">
+                          <p className="text-secondary">
+                            <span className="font-semibold">Previous:</span>{' '}
+                            {decision.priorClaim}
+                          </p>
+                          <p className="text-primary">
+                            <span className="font-semibold">Revised:</span>{' '}
+                            {decision.newClaim}
+                          </p>
+                          <p className="text-tertiary">
+                            <span className="font-semibold">Reason:</span>{' '}
+                            {decision.changeReason}
+                          </p>
+                          <p className="text-tertiary">
+                            <span className="font-semibold">Impact:</span>{' '}
+                            {decision.impact}
+                          </p>
+                        </div>
+
+                        <p className="text-xs text-tertiary">
+                          {new Date(decision.timestamp).toLocaleString()}
+                        </p>
+                      </div>
+                    ))}
+
+                    {dashboardAnalytics.decisions.length === 0 && (
+                      <div className="p-md rounded-md bg-secondary border border-secondary">
+                        <p className="text-xs text-tertiary">
+                          No recorded belief revisions for this provenance filter.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* WALRUS INFRASTRUCTURE STATUS */}
+                  <div className="p-md rounded-md bg-secondary border border-secondary space-y-sm">
+                    <span className="text-xs font-semibold text-primary">
+                      Walrus Infrastructure
+                    </span>
+
+                    <div className="space-y-xs text-xs">
+                      <div>
+                        <p className="text-tertiary mb-xs">Publisher Endpoint</p>
+                        <p className="font-mono text-secondary break-all">
+                          {health?.integrations.walrusMemory.publisherUrl || 'Not configured'}
+                        </p>
+                        <p className="text-tertiary mt-xs">
+                          Status: {health?.integrations.walrusMemory.publisherStatus || 'Unknown'}
+                        </p>
+                      </div>
+
+                      <div className="border-t border-secondary pt-sm">
+                        <p className="text-tertiary mb-xs">Aggregator Endpoint</p>
+                        <p className="font-mono text-secondary break-all">
+                          {health?.integrations.walrusMemory.aggregatorUrl || 'Not configured'}
+                        </p>
+                        <p className="text-tertiary mt-xs">
+                          Status: {health?.integrations.walrusMemory.aggregatorStatus || 'Unknown'}
+                        </p>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -734,6 +1324,9 @@ export default function App() {
                 <label className="text-sm font-medium text-secondary">Research Inquiry or Hypothesis</label>
                 <div className="flex gap-sm">
                   <input
+                    aria-label="Research inquiry"
+                    required
+                    minLength={8}
                     type="text"
                     value={researchQuery}
                     onChange={e => setResearchQuery(e.target.value)}
@@ -818,13 +1411,17 @@ export default function App() {
                         <span className="text-xs font-mono font-bold text-brand-primary">
                           {selectedSession?.id || 'Active Session'}
                         </span>
-                        <span className={`inline-flex items-center rounded-xs px-xs py-xxs font-mono text-xs uppercase ${
-                          selectedSession?.provenance === 'live_production'
-                            ? 'bg-utility-brand-50 text-utility-brand-700 border border-utility-brand-200'
-                            : 'bg-utility-gray-50 text-utility-gray-700 border border-utility-gray-200'
-                        }`}>
-                          {selectedSession?.provenance === 'live_production' ? 'Live Confirmed' : 'Demo Seed'}
-                        </span>
+                        {selectedSession && (
+  <span className={`inline-flex items-center rounded-xs px-xs py-xxs font-mono text-xs uppercase ${
+    selectedSession.provenance === 'live_production'
+      ? 'bg-utility-brand-50 text-utility-brand-700 border border-utility-brand-200'
+      : 'bg-utility-gray-50 text-utility-gray-700 border border-utility-gray-200'
+  }`}>
+    {selectedSession.provenance === 'live_production'
+      ? 'Live Confirmed'
+      : 'Demo Seed'}
+  </span>
+)}
                         <h2 className="text-heading-xs font-semibold text-primary">
                           Epistemic Finding & Claim Breakdown
                         </h2>
@@ -835,7 +1432,9 @@ export default function App() {
                     </div>
                     {selectedSession && (
                       <span className="inline-flex items-center gap-xs rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
-                        Confidence: {Math.round(selectedSession.confidence * 100)}%
+                        Confidence: {selectedSession.confidence == null
+                          ? 'N/A'
+                          : `${Math.round(selectedSession.confidence * 100)}%`}
                       </span>
                     )}
                   </div>
@@ -922,35 +1521,49 @@ export default function App() {
                       <span>Recalled Memories</span>
                     </h3>
                     <span className="text-xs font-mono text-tertiary">
-                      {selectedSession?.recalledMemoryIds.length || 0} Recalled
+                    {selectedRecalledMemories.length} Recalled
                     </span>
                   </div>
 
-                  {selectedSession && selectedSession.recalledMemoryIds.length > 0 ? (
-                    <div className="space-y-sm">
-                      {selectedSession.recalledMemoryIds.map(memId => {
-                        const mem = memories.find(m => m.id === memId);
-                        return (
-                          <div key={memId} className="p-sm rounded-md bg-secondary border border-secondary text-xs space-y-xs">
-                            <div className="flex items-center justify-between">
-                              <span className="font-mono font-bold text-brand-primary">{memId}</span>
-                              <span className="text-quaternary font-mono uppercase text-[10px]">{mem?.provenance}</span>
-                            </div>
-                            <p className="text-primary font-medium">{mem?.title || 'Memory Vector'}</p>
-                            <p className="text-tertiary line-clamp-2">{mem?.content}</p>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <div className="p-md rounded-md bg-secondary border border-secondary text-xs text-tertiary text-center">
-                      No prior matching memories were triggered by this query.
-                    </div>
-                  )}
+                 {selectedSession && selectedRecalledMemories.length > 0 ? (
+  <div className="space-y-sm">
+    {selectedRecalledMemories.map(mem => {
+      const memId = mem.id;
 
+      return (
+        <div
+          key={memId}
+          className="p-sm rounded-md bg-secondary border border-secondary text-xs space-y-xs"
+        >
+          <div className="flex items-center justify-between">
+            <span className="font-mono font-bold text-brand-primary">
+              {memId}
+            </span>
+            <span className="text-quaternary font-mono uppercase text-[10px]">
+              {mem.provenance}
+            </span>
+          </div>
+
+          <p className="text-primary font-medium">
+            {mem.title || 'Memory Vector'}
+          </p>
+
+          <p className="text-tertiary line-clamp-2">
+            {mem.content}
+          </p>
+        </div>
+      );
+    })}
+  </div>
+) : (
+  <div className="p-md rounded-md bg-secondary border border-secondary text-xs text-tertiary text-center">
+    No prior matching memories were triggered by this query.
+  </div>
+)}
                   <button
+                    type="button"
                     onClick={() => setActiveTab('memories')}
-                    className="inline-flex w-full items-center justify-center gap-sm rounded-lg bg-primary px-lg py-sm text-sm font-semibold text-secondary border border-primary shadow-xs hover:bg-primary-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
+                    className="w-full rounded-md bg-secondary px-md py-sm text-xs font-semibold text-secondary hover:bg-secondary-hover"
                   >
                     Open Memory Explorer
                   </button>
@@ -1011,6 +1624,9 @@ export default function App() {
                   <div className="flex flex-col gap-sm">
                     <label className="text-sm font-medium text-secondary">Memory Title</label>
                     <input
+                      aria-label="Memory title"
+                      required
+                      minLength={3}
                       type="text"
                       value={newMemTitle}
                       onChange={e => setNewMemTitle(e.target.value)}
@@ -1035,6 +1651,9 @@ export default function App() {
                 <div className="flex flex-col gap-sm">
                   <label className="text-sm font-medium text-secondary">Memory Content / Statement</label>
                   <textarea
+                    aria-label="Memory content"
+                    required
+                    minLength={10}
                     rows={3}
                     value={newMemContent}
                     onChange={e => setNewMemContent(e.target.value)}
@@ -1112,7 +1731,7 @@ export default function App() {
             </div>
 
             {/* Memory Table */}
-            <div className="overflow-hidden rounded-xl border border-secondary bg-primary shadow-xs">
+            <div className="responsive-table overflow-hidden rounded-xl border border-secondary bg-primary shadow-xs">
               <table className="w-full">
                 <thead className="sticky top-0 z-10 bg-secondary">
                   <tr className="border-b border-secondary text-left">
@@ -1239,16 +1858,16 @@ export default function App() {
               <div>
                 <p className="text-sm font-semibold text-utility-brand-600">Read-Only Cryptographic Verification Guarantee</p>
                 <p className="mt-xxs text-sm text-tertiary">
-                  RecallGuard strictly runs read-only JSON-RPC queries. It never requests wallet connection, never signs transactions, and never mutates on-chain state. All Sui RPC calls are executed server-side via Tatum.
+                  RecallGuard strictly runs read-only gRPC queries. It never requests wallet connection, never signs transactions, and never mutates on-chain state. All Sui gRPC calls are executed server-side via Tatum.
                 </p>
               </div>
             </div>
 
-            {/* Live RPC Console */}
+            {/* Live gRPC Console */}
             <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs space-y-md">
               <div className="flex items-center justify-between">
                 <span className="text-sm font-medium text-secondary">
-                  Sui JSON-RPC Query Builder
+                  Sui gRPC Query Console
                 </span>
                 <div className="flex items-center gap-xs">
                   <span className="text-xs text-tertiary">Network:</span>
@@ -1271,14 +1890,12 @@ export default function App() {
                     onChange={e => {
                       setRpcMethod(e.target.value);
                       if (e.target.value === 'sui_getLatestCheckpointSequenceNumber') setRpcParamsJson('[]');
-                      if (e.target.value === 'suix_getReferenceGasPrice') setRpcParamsJson('[]');
                       if (e.target.value === 'sui_getChainIdentifier') setRpcParamsJson('[]');
                       if (e.target.value === 'sui_getObject') setRpcParamsJson('["0x5", { "showType": true, "showContent": true }]');
                     }}
                     className="rounded-md bg-primary px-lg py-sm text-sm text-primary border border-primary font-mono focus-visible:ring-2 focus-visible:ring-focus-ring"
                   >
                     <option value="sui_getLatestCheckpointSequenceNumber">sui_getLatestCheckpointSequenceNumber</option>
-                    <option value="suix_getReferenceGasPrice">suix_getReferenceGasPrice</option>
                     <option value="sui_getChainIdentifier">sui_getChainIdentifier</option>
                     <option value="sui_getObject">sui_getObject</option>
                   </select>
@@ -1316,14 +1933,18 @@ export default function App() {
               </div>
 
               {/* Status / Output Display */}
+              
+              {/* Status / Output Display */}
               {rpcError && (
                 <div className="flex gap-lg rounded-xl bg-utility-error-50 p-xl">
                   <AlertCircle className="mt-xxs size-5 shrink-0 text-utility-error-600" aria-hidden="true" />
                   <div className="flex-1">
-                    <p className="text-sm font-semibold text-utility-error-600">RPC Gateway Error</p>
+                    <p className="text-sm font-semibold text-utility-error-600">
+                      Sui gRPC Request Failed
+                    </p>
                     <p className="mt-xxs text-sm text-tertiary">{rpcError}</p>
                     <p className="mt-xs text-xs font-semibold text-utility-error-600">
-                      Truth Guarantee: This query is unverified and will not be reported as a verified on-chain fact.
+                      This request did not retrieve evidence. No verified fact is claimed.
                     </p>
                   </div>
                 </div>
@@ -1331,39 +1952,73 @@ export default function App() {
 
               {rpcResult && (
                 <div className="space-y-sm">
-                  {/* Status Banner */}
+                  {/* gRPC Status Banner */}
                   <div className={`flex gap-lg rounded-xl p-md ${
-                    rpcResult.isVerifiedFact
+                    rpcResult.status === 'success'
                       ? 'bg-utility-success-50 text-utility-success-700 border border-utility-success-200'
                       : 'bg-utility-warning-50 text-utility-warning-700 border border-utility-warning-200'
                   }`}>
                     <Info className="mt-xxs size-5 shrink-0" aria-hidden="true" />
+
                     <div className="flex-1 text-xs">
                       <p className="font-semibold text-sm">
-                        {rpcResult.isVerifiedFact ? 'Cryptographic On-Chain Verification Confirmed' : `Gateway Status: HTTP ${rpcResult.httpStatus} ${rpcResult.httpStatusText || ''}`}
+                        {rpcResult.status === 'success'
+                          ? 'gRPC Request Successful'
+                          : 'gRPC Request Not Confirmed'}
                       </p>
-                      {rpcResult.diagnostics ? (
-                        <div className="mt-xs space-y-xxs text-tertiary">
-                          <p><strong className="text-secondary">Issue:</strong> {rpcResult.diagnostics.issue}</p>
-                          <p><strong className="text-secondary">Official Endpoint:</strong> {rpcResult.diagnostics.endpointTested}</p>
-                          <p><strong className="text-secondary">Diagnosis:</strong> {rpcResult.diagnostics.reason}</p>
-                          <p><strong className="text-secondary">Resolution:</strong> {rpcResult.diagnostics.resolution}</p>
-                        </div>
-                      ) : (
-                        <p className="mt-xxs text-tertiary">Live JSON-RPC answer returned by Tatum Gateway.</p>
-                      )}
+
+                      <p className="mt-xxs text-tertiary">
+                        {rpcResult.status === 'success'
+                          ? 'Read-only data successfully retrieved from Tatum Sui gRPC.'
+                          : 'The request did not return a confirmed successful response.'}
+                      </p>
+
+                      <p className="mt-xs text-tertiary">
+                        <strong className="text-secondary">Evidence status:</strong>{' '}
+                        {rpcResult.evidenceStatus || 'Not established'}
+                      </p>
+
+                      <p className="mt-xxs text-tertiary">
+                        <strong className="text-secondary">Verification:</strong>{' '}
+                        {rpcResult.cryptographicallyVerified
+                          ? 'Cryptographic verification confirmed'
+                          : 'Not independently cryptographically verified'}
+                      </p>
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-between text-xs text-tertiary">
-                    <span>Gateway Result from Tatum ({rpcResult.gatewayUrl})</span>
-                    <span className="font-mono">{rpcResult.timestamp}</span>
+                  {/* Request Metadata */}
+                  <div className="flex flex-wrap items-center justify-between gap-sm text-xs text-tertiary">
+                    <div>
+                      <span className="font-semibold text-secondary">
+                        gRPC Result from Tatum Sui
+                      </span>
+                      <span className="ml-sm">
+                        {rpcResult.operation || 'Sui gRPC operation'}
+                      </span>
+                    </div>
+
+                    <span className="font-mono">
+                      {rpcResult.timestamp}
+                    </span>
                   </div>
+
+                  <div className="flex items-center justify-between text-xs text-tertiary">
+                    <span>
+                      Provider: {rpcResult.provider || 'Tatum Sui gRPC'}
+                    </span>
+                    <span>
+                      Duration: {rpcResult.durationMs ?? '—'} ms
+                    </span>
+                  </div>
+
+                  {/* Raw gRPC Response */}
                   <pre className="p-md rounded-md bg-secondary border border-secondary font-mono text-xs text-primary overflow-x-auto leading-relaxed">
                     {JSON.stringify(rpcResult, null, 2)}
                   </pre>
                 </div>
               )}
+
             </section>
           </div>
         )}
@@ -1391,20 +2046,27 @@ export default function App() {
                 </p>
               </section>
 
+             
               <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs">
                 <p className="text-sm text-tertiary">Epistemic Revisions</p>
                 <p className="mt-md text-heading-xs font-semibold text-brand-primary">
                   {decisions.length}
                 </p>
-                <p className="text-xs text-secondary mt-xs">Contradictions resolved</p>
+                <p className="text-xs text-secondary mt-xs">
+                  Recorded belief revision records
+                </p>
               </section>
 
               <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs">
-                <p className="text-sm text-tertiary">Tatum RPC Source Weight</p>
+                <p className="text-sm text-tertiary">Live Production Revisions</p>
                 <p className="mt-md text-heading-xs font-semibold text-utility-success-700">
-                  0.98 / 1.0
+                  {decisions.filter(
+                    decision => decision.provenance === 'live_production'
+                  ).length}
                 </p>
-                <p className="text-xs text-secondary mt-xs">Priority epistemic authority</p>
+                <p className="text-xs text-secondary mt-xs">
+                  Revisions generated by live production sessions
+                </p>
               </section>
             </div>
 
@@ -1580,7 +2242,17 @@ export default function App() {
             </div>
           </div>
         )}
+        </>}
       </main>
+
+      {/* Toast notifications */}
+      {toast && (
+        <div className={`toast toast-${toast.type}`} role="status" aria-live="polite">
+          {toast.type === 'success' ? <CheckCircle2 className="size-5 shrink-0" /> : toast.type === 'error' ? <AlertCircle className="size-5 shrink-0" /> : <Info className="size-5 shrink-0" />}
+          <span>{toast.message}</span>
+          <button type="button" onClick={() => setToast(null)} aria-label="Dismiss notification">×</button>
+        </div>
+      )}
 
       {/* Footer */}
       <footer className="border-t border-secondary bg-primary px-xl py-md mt-auto">

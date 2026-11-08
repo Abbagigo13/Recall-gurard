@@ -10,6 +10,7 @@ import './proxy-bootstrap.mjs'
 import './credentials-store.mjs'
 
 import express from 'express'
+import { readFileSync } from 'node:fs'
 import { createServer as createHttpServer } from 'http'
 import { createServer as createViteServer } from 'vite'
 import react from '@vitejs/plugin-react'
@@ -51,11 +52,28 @@ const vite = await createViteServer({
   appType: 'spa',
 })
 
+// History-API app route: serve the transformed index.html for /dashboard
+// (and only there) so direct navigation and refresh work. API routes above
+// take precedence; everything else falls through to Vite as before.
+app.get('/dashboard', async (req, res, next) => {
+  try {
+    const template = readFileSync(path.join(root, 'index.html'), 'utf8')
+    const html = await vite.transformIndexHtml(req.originalUrl, template)
+    res.type('html').send(html)
+  } catch (error) {
+    next(error)
+  }
+})
+
 app.use(vite.middlewares)
 
-// Start HTTP server.
+// Start HTTP server on the loopback interface only. The demo spends real
+// API quota (Tatum, Meta, Walrus) on unauthenticated endpoints, so it must
+// never listen on an externally reachable interface by default. There is
+// intentionally no environment override: to expose the server, edit the
+// address below explicitly.
 const port = process.env.PORT ?? 3000
 
-server.listen(port, () => {
-  console.log(`RecallGuard development server listening on :${port}`)
+server.listen(port, '127.0.0.1', () => {
+  console.log(`RecallGuard development server listening on 127.0.0.1:${port}`)
 })

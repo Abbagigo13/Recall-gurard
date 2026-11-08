@@ -1,4 +1,12 @@
 import { Router } from 'express'
+import { createRateLimiter, rateLimitOptions } from '../rate-limit.mjs'
+
+// Demo spend protection: unauthenticated expensive endpoints are
+// rate-limited before their handlers run, so rejected requests can never
+// trigger Tatum, Meta, or Walrus calls. Single-user demo defaults.
+const sessionsLimiter = createRateLimiter(rateLimitOptions('SESSIONS', 30, 60_000))
+const memoriesLimiter = createRateLimiter(rateLimitOptions('MEMORIES', 60, 60_000))
+const diagnosticsLimiter = createRateLimiter(rateLimitOptions('DIAGNOSTICS', 30, 60_000))
 import {
   buildResearchPlan,
   rankMemories
@@ -7,9 +15,9 @@ import {
   buildRevisionOutcome,
   compareResearchEvidence
 } from '../evidence-comparison.mjs'
-import { publishAndVerify, WALRUS_WRITE_ERROR_CODE } from '../walrus-storage.mjs'
+import { publishAndVerify, probeWalrusAggregator, WALRUS_WRITE_ERROR_CODE } from '../walrus-storage.mjs'
 import { initStore, publicPersistenceError, PERSISTENCE_ERROR_CODE } from '../store.mjs'
-import { analyzeResearch, META_AI_ERROR_CODE, metaModel } from '../meta-ai.mjs'
+import { analyzeResearch, META_AI_ERROR_CODE, metaModel, metaApiBase } from '../meta-ai.mjs'
 import {
   tatumFetch,
   tatumRpc,
@@ -18,10 +26,10 @@ import {
 } from '../tatum-client.mjs'
 
 import {
-  getSuiNetworkStatus,
-  getSuiServiceInfo,
-  getSuiCheckpoint,
-  getSuiObject
+  getSuiNetworkStatus as grpcGetSuiNetworkStatus,
+  getSuiServiceInfo as grpcGetSuiServiceInfo,
+  getSuiCheckpoint as grpcGetSuiCheckpoint,
+  getSuiObject as grpcGetSuiObject
 } from '../sui-grpc-client.mjs'
 
 const router = Router()
@@ -200,6 +208,21 @@ export function getPersistenceStore() {
   return persistenceStore
 }
 
+// Injectable Tatum Sui gRPC client (test seam for the offline suite).
+// grpc-js opens its own sockets outside fetch, so HTTP mocks cannot stub
+// it. Production always uses the real client; offline tests inject a fake
+// via setSuiGrpcClient and restore with setSuiGrpcClient(null).
+const realSuiGrpcClient = {
+  getSuiNetworkStatus: grpcGetSuiNetworkStatus,
+  getSuiServiceInfo: grpcGetSuiServiceInfo,
+  getSuiCheckpoint: grpcGetSuiCheckpoint,
+  getSuiObject: grpcGetSuiObject
+}
+let suiGrpcClient = realSuiGrpcClient
+export function setSuiGrpcClient(client) {
+  suiGrpcClient = client ?? realSuiGrpcClient
+}
+
 // Meta AI interpretation for one persisted deterministic session.
 // Never throws: every outcome resolves to stable { aiStatus, aiAnalysis,
 // aiErrorCode }. The deterministic session, comparison, candidates, and
@@ -228,8 +251,12 @@ export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn
       : 'unavailable'
     const errorCode = (result && result.errorCode) || META_AI_ERROR_CODE
     // Audit the failed attempt with stable fields only: status, model,
-    // provider, prompt version, timestamp, and the stable error code.
+    // provider, prompt version, timestamp, the stable error code, and
+    // sanitized validation diagnostics (field paths and rule names only).
     // Never raw provider detail, request bodies, or model output.
+    const validationErrors = result && Array.isArray(result.validationErrors)
+      ? result.validationErrors
+      : []
     let recorded = false
     try {
       recorded = store.persistAiAnalysis({
@@ -241,7 +268,8 @@ export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn
         status: aiStatus,
         analysis: null,
         latencyMs: (result && result.latencyMs) ?? null,
-        errorCode
+        errorCode,
+        validationErrors
       })
     } catch {
       recorded = false
@@ -295,30 +323,11 @@ router.get('/health', async (_req, res) => {
   const walrusPublisherUrl = DEFAULT_WALRUS_PUBLISHER
   const walrusAggregatorUrl = DEFAULT_WALRUS_AGGREGATOR
 
-  // Non-mutating Walrus aggregator connectivity check
-  let walrusAggregatorStatus = 'checking'
-  let walrusAggregatorLatencyMs = null
-
-  try {
-    const started = Date.now()
-
-    const response = await fetch(
-      `${walrusAggregatorUrl}/v1/blobs/nonexistent_test_probe`,
-      {
-        method: 'GET',
-        signal: AbortSignal.timeout(6000)
-      }
-    )
-
-    walrusAggregatorLatencyMs = Date.now() - started
-
-    walrusAggregatorStatus =
-      response.ok || response.status === 404
-        ? 'reachable'
-        : `http-${response.status}`
-  } catch {
-    walrusAggregatorStatus = 'unreachable'
-  }
+  // Non-mutating Walrus aggregator connectivity check. Read-only probe:
+  // no publication, no read-back, no writes of any kind.
+  const aggregatorProbe = await probeWalrusAggregator({ aggregatorUrl: walrusAggregatorUrl })
+  const walrusAggregatorStatus = aggregatorProbe.status
+  const walrusAggregatorLatencyMs = aggregatorProbe.latencyMs
 
   // Do not perform storage writes during health checks
   const walrusPublisherStatus = 'not_checked'
@@ -335,7 +344,7 @@ router.get('/health', async (_req, res) => {
   if (hasTatumKey) {
     try {
       const started = Date.now()
-      const result = await getSuiNetworkStatus('mainnet')
+      const result = await suiGrpcClient.getSuiNetworkStatus('mainnet')
 
       tatumRpcLatencyMs = Date.now() - started
       tatumRpcStatus = 'connected'
@@ -407,9 +416,12 @@ router.get('/health', async (_req, res) => {
   })
 })
 
-// Config status for UI badges
+// Config status for UI badges (local configuration check only: no network
+// requests, no secret values in the response).
 router.get('/config-status', async (_req, res) => {
   const hasTatumKey = Boolean(process.env.TATUM_API_KEY)
+  const metaKey = process.env.META_API_KEY
+  const metaConfigured = typeof metaKey === 'string' && metaKey.length > 0
   res.json({
     hasTatumKey,
     hasWalrusSdk: true,
@@ -420,6 +432,13 @@ router.get('/config-status', async (_req, res) => {
       version: '0.2.1-compatible',
       mode: 'live-walrus-http-bridge',
       storageEngine: 'Walrus RedStuff 2D Reed-Solomon'
+    },
+    meta: {
+      configured: metaConfigured,
+      provider: 'meta',
+      model: metaModel(),
+      baseUrl: metaApiBase(),
+      status: metaConfigured ? 'configured' : 'missing_key'
     }
   })
 })
@@ -488,12 +507,38 @@ router.get('/sessions', (req, res) => {
 router.get('/sessions/:id', (req, res) => {
   const session = sessions.find(s => s.id === req.params.id)
   if (!session) return res.status(404).json({ error: 'Session not found' })
-  res.json(session)
+  // Historical AI status is read from the persisted audit record only.
+  // Never runs inference and never writes: a pure read for the detail view.
+  let recorded = null
+  try {
+    const rows = persistenceStore.listAiAnalysisBySession(session.id)
+    recorded = rows.length > 0 ? rows[0] : null
+  } catch {
+    recorded = null
+  }
+  if (!recorded) {
+    return res.json({
+      ...session,
+      aiStatus: 'not_run',
+      aiAnalysis: null,
+      aiErrorCode: null,
+      aiModel: null,
+      aiProvider: null
+    })
+  }
+  return res.json({
+    ...session,
+    aiStatus: recorded.status,
+    aiAnalysis: recorded.analysis,
+    aiErrorCode: recorded.errorCode,
+    aiModel: recorded.model,
+    aiProvider: recorded.provider
+  })
 })
 
 
 
-router.post('/sessions', async (req, res) => {
+router.post('/sessions', sessionsLimiter, async (req, res) => {
   const { question, network = 'mainnet' } = req.body
 
   if (!question || typeof question !== 'string' || !question.trim()) {
@@ -514,10 +559,16 @@ router.post('/sessions', async (req, res) => {
   const researchPlan = buildResearchPlan(cleanQuestion)
 
   // 2. Recall and rank relevant memories.
-  // Recall is not independent fact verification.
+  // Recall is not independent fact verification. Live research recalls
+  // live memories only: demo_seed rows stay visible in demo sessions and
+  // listings, but must never influence a live_production session, its
+  // claims, or its AI input.
   const rankedMemories = rankMemories(
     cleanQuestion,
-    memories.filter(memory => memory.status !== 'superseded')
+    memories.filter(
+      memory => memory.status !== 'superseded' &&
+        memory.provenance === 'live_production'
+    )
   )
 
   const matchedMemories = rankedMemories.map(item => item.memory)
@@ -535,7 +586,7 @@ router.post('/sessions', async (req, res) => {
     } else {
       try {
         if (researchPlan.capability === 'sui_checkpoint_status') {
-          const result = await getSuiNetworkStatus(network)
+          const result = await suiGrpcClient.getSuiNetworkStatus(network)
           const checkpoint = result.checkpoint?.checkpoint
 
           onChainSuiData = {
@@ -551,7 +602,7 @@ router.post('/sessions', async (req, res) => {
           }
 
         } else if (researchPlan.capability === 'sui_object_lookup') {
-          const result = await getSuiObject(
+          const result = await suiGrpcClient.getSuiObject(
             network,
             researchPlan.requestedObjectId
           )
@@ -571,7 +622,7 @@ router.post('/sessions', async (req, res) => {
           researchPlan.capability === 'sui_chain_identifier' ||
           researchPlan.capability === 'sui_network_status'
         ) {
-          const result = await getSuiServiceInfo(network)
+          const result = await suiGrpcClient.getSuiServiceInfo(network)
 
           onChainSuiData = {
             network: `sui-${network}`,
@@ -951,7 +1002,7 @@ router.get('/memories', (req, res) => {
 })
 
 // Real Walrus Memory Storage: calls official Walrus Publisher HTTP PUT
-router.post('/memories', async (req, res) => {
+router.post('/memories', memoriesLimiter, async (req, res) => {
   const { title, content, category = 'epistemic_stance', sourceReference = 'Manual Input' } = req.body
   if (!title || !content) {
     return res.status(400).json({ error: 'Title and content are required' })
@@ -1137,7 +1188,7 @@ router.post('/sui/rpc', async (req, res) => {
       case 'sui_getLatestCheckpointSequenceNumber': {
         operation = 'LedgerService.GetServiceInfo'
 
-        const info = await getSuiServiceInfo(network)
+        const info = await suiGrpcClient.getSuiServiceInfo(network)
 
         result = String(info.checkpointHeight)
         break
@@ -1146,7 +1197,7 @@ router.post('/sui/rpc', async (req, res) => {
       case 'sui_getChainIdentifier': {
         operation = 'LedgerService.GetServiceInfo'
 
-        const info = await getSuiServiceInfo(network)
+        const info = await suiGrpcClient.getSuiServiceInfo(network)
 
         result = info.chainId
         break
@@ -1168,7 +1219,7 @@ router.post('/sui/rpc', async (req, res) => {
           })
         }
 
-        const objectResponse = await getSuiObject(
+        const objectResponse = await suiGrpcClient.getSuiObject(
           network,
           objectId,
           options
@@ -1224,7 +1275,20 @@ router.post('/sui/rpc', async (req, res) => {
 
 
 // Detailed server-side diagnostics endpoint for Tatum Sui gRPC
-router.get('/sui/diagnostics', async (_req, res) => {
+router.get('/sui/diagnostics', diagnosticsLimiter, async (_req, res) => {
+  // Expensive diagnostics fan out to several live external services per
+  // request, so they are opt-in. Safe default: disabled in demo mode.
+  // To enable for local debugging, set RECALLGUARD_ENABLE_DIAGNOSTICS=1.
+  const diagnosticsEnabled = process.env.RECALLGUARD_ENABLE_DIAGNOSTICS === '1' ||
+    String(process.env.RECALLGUARD_ENABLE_DIAGNOSTICS).toLowerCase() === 'true'
+  if (!diagnosticsEnabled) {
+    return res.json({
+      enabled: false,
+      status: 'disabled',
+      code: 'DIAGNOSTICS_DISABLED',
+      message: 'Set RECALLGUARD_ENABLE_DIAGNOSTICS=1 to enable live diagnostics.'
+    })
+  }
   const hasKey = Boolean(process.env.TATUM_API_KEY)
   const networks = ['mainnet', 'testnet']
 
@@ -1248,7 +1312,7 @@ router.get('/sui/diagnostics', async (_req, res) => {
 
       try {
         const startedAt = Date.now()
-        const networkStatus = await getSuiNetworkStatus(net)
+        const networkStatus = await suiGrpcClient.getSuiNetworkStatus(net)
         const durationMs = Date.now() - startedAt
 
         const serviceInfo = networkStatus.serviceInfo || {}

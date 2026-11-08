@@ -8,6 +8,7 @@ import {
   buildAnalysisMessages,
   normalizeMetaOptions,
   parseRetryAfterMs,
+  sanitizeValidationErrors,
   RESEARCH_ANALYSIS_SCHEMA,
   META_AI_ERROR_CODE,
   META_AI_INVALID_CODE,
@@ -476,5 +477,79 @@ describe('meta-ai client', () => {
     assert.ok(userContent.includes('MEM-1'))
     assert.ok(!userContent.includes('SECRET-CONTENT'))
     assert.ok(messages.find((m) => m.role === 'system').content.includes('Never invent'))
+  })
+
+  it('still rejects honest verification denials that fail the narrow templates', async () => {
+    const bad = {
+      ...validAnalysis(),
+      interpretation: 'The checkpoint advanced. Further verification is needed.'
+    }
+    const checked = validateAnalysis(bad)
+    assert.equal(checked.valid, false)
+    assert.equal(checked.errors.length, 1)
+    const sanitized = sanitizeValidationErrors(checked.errors)
+    assert.deepEqual(sanitized, ['guardrail violation in interpretation'])
+    const { fetchFn } = mockFetch([completionResponse(bad)])
+    const result = await analyzeResearch({ question: 'q?' }, { fetchFn, ...noRetry })
+    assert.equal(result.ok, false)
+    assert.equal(result.aiStatus, 'unavailable')
+    assert.equal(result.analysis, null)
+    assert.deepEqual(result.validationErrors, ['guardrail violation in interpretation'])
+  })
+
+  it('sanitizes unexpected-property diagnostics to category and count', async () => {
+    const bad = {
+      ...validAnalysis(),
+      model: 'rogue-model-name',
+      extraTop: 'ROGUE-TOP-SECRET',
+      contradictions: [{ claim: 'a', against: 'b', severity: 'low', forgedField: 'ROGUE-NESTED' }]
+    }
+    const checked = validateAnalysis(bad)
+    assert.equal(checked.valid, false)
+    const sanitized = sanitizeValidationErrors(checked.errors)
+    const joined = sanitized.join('; ')
+    assert.ok(!joined.includes('rogue-model-name'))
+    assert.ok(!joined.includes('ROGUE-TOP-SECRET'))
+    assert.ok(!joined.includes('extraTop'))
+    assert.ok(!joined.includes('forgedField'))
+    assert.ok(!joined.includes('ROGUE-NESTED'))
+    assert.ok(sanitized.some((line) => /^unexpected top-level properties \(\d+ names withheld\)$/.test(line)))
+    assert.ok(sanitized.some((line) => /^contradictions\[0\] has unexpected properties \(\d+ names withheld\)$/.test(line)))
+  })
+
+  it('reports structural failures with stable field paths and correct counts', () => {
+    const bad = { ...validAnalysis() }
+    delete bad.confidenceNote
+    bad.interpretation = 42
+    const checked = validateAnalysis(bad)
+    assert.equal(checked.valid, false)
+    assert.equal(checked.errors.length, 3)
+    const sanitized = sanitizeValidationErrors(checked.errors)
+    assert.deepEqual(sanitized, [
+      'missing field: confidenceNote',
+      'interpretation must be a string',
+      'confidenceNote must be a string'
+    ])
+  })
+
+  it('serializes sanitized diagnostics without model text in logs', async () => {
+    const lines = []
+    const original = console.error
+    console.error = (...args) => { lines.push(args.join(' ')) }
+    try {
+      const bad = {
+        ...validAnalysis(),
+        injectedProp: 'ROGUE-PROPERTY-VALUE'
+      }
+      const { fetchFn } = mockFetch([completionResponse(bad)])
+      await analyzeResearch({ question: 'q?' }, { fetchFn, ...noRetry })
+    } finally {
+      console.error = original
+    }
+    const joined = lines.join('\n')
+    assert.match(joined, /failed validation \(1 problem/)
+    assert.ok(joined.includes('unexpected top-level properties (1 names withheld)'))
+    assert.ok(!joined.includes('ROGUE-PROPERTY-VALUE'))
+    assert.ok(!joined.includes('injectedProp'))
   })
 })

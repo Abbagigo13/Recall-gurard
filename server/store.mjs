@@ -795,7 +795,14 @@ function memoryStore(db, dbPath) {
             entityType: 'ai_analysis',
             entityId: record.id,
             provenance: 'live_production',
-            details: { sessionId: record.sessionId, model: record.model }
+            // Sanitized validation diagnostics only: the caller passes
+            // field paths and rule names (never model text). Stored in
+            // the existing free-form details JSON: no schema change.
+            details: {
+              sessionId: record.sessionId,
+              model: record.model,
+              validationErrors: record.validationErrors ?? []
+            }
           })
         }, (rollbackError) => this.onRollbackFailure(rollbackError))
         return true

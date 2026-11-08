@@ -59,6 +59,49 @@ function delayForAttempt(retryDelaysMs, attempt) {
  * @returns {object} result with writeStatus, storageStatus, storageVerified,
  *   blobId, suiObjectId, aggregatorUrl, attempts, latencies, sanitized error
  */
+/**
+ * Classify one aggregator probe HTTP status into a stable health value.
+ * Pure function: no I/O, no secrets, safe to log and expose.
+ *
+ * - probe_accepted: expected probe response (any 2xx, or 404
+ *   blob-not-found). Preserves the previous `response.ok` semantics.
+ * - probe_rejected: host answered with another 4xx — reachable, but the
+ *   probe was rejected, so service health is inconclusive (never healthy).
+ * - service_error: host answered 5xx.
+ */
+export function classifyAggregatorProbeStatus(httpStatus) {
+  if (httpStatus === 404) return 'probe_accepted'
+  if (Number.isInteger(httpStatus) && httpStatus >= 200 && httpStatus < 300) return 'probe_accepted'
+  if (Number.isInteger(httpStatus) && httpStatus >= 400 && httpStatus < 500) return 'probe_rejected'
+  if (Number.isInteger(httpStatus) && httpStatus >= 500 && httpStatus < 600) return 'service_error'
+  return 'probe_rejected'
+}
+
+/**
+ * Non-mutating aggregator connectivity probe: one exact-byte-free GET of a
+ * nonexistent blob. Never publishes, never writes, never throws — a
+ * network failure reports `unreachable`.
+ */
+export async function probeWalrusAggregator({
+  fetchFn = fetch,
+  aggregatorUrl = DEFAULT_AGGREGATOR_URL,
+  timeoutMs = 6000
+} = {}) {
+  const started = Date.now()
+  try {
+    const response = await fetchFn(`${aggregatorUrl}/v1/blobs/nonexistent_test_probe`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(timeoutMs)
+    })
+    return {
+      status: classifyAggregatorProbeStatus(response.status),
+      latencyMs: Date.now() - started
+    }
+  } catch {
+    return { status: 'unreachable', latencyMs: Date.now() - started }
+  }
+}
+
 export async function publishAndVerify(payload, options = {}) {
   const {
     publisherUrl = DEFAULT_PUBLISHER_URL,

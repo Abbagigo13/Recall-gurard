@@ -355,6 +355,29 @@ export function validateAnalysis(data) {
   return errors.length === 0 ? { valid: true, errors: [] } : { valid: false, errors }
 }
 
+// Strip anything a model could have supplied from validation errors before
+// they reach logs or audit records. Every message above uses our own field
+// paths and rule names except the unexpected-properties messages, which
+// echo model-chosen key names — those are reduced to a category and count.
+// Unknown shapes fail closed to a fixed message rather than passing through.
+export function sanitizeValidationErrors(errors) {
+  if (!Array.isArray(errors)) return []
+  return errors.map((message) => {
+    if (typeof message !== 'string') return 'validation failed (detail withheld)'
+    const unexpectedTop = message.match(/^unexpected top-level properties: (.*)$/)
+    if (unexpectedTop) {
+      const count = unexpectedTop[1].split(',').filter((name) => name.length > 0).length
+      return `unexpected top-level properties (${count} names withheld)`
+    }
+    const unexpectedNested = message.match(/^(contradictions\[\d+\] has unexpected properties): (.*)$/)
+    if (unexpectedNested) {
+      const count = unexpectedNested[2].split(',').filter((name) => name.length > 0).length
+      return `${unexpectedNested[1]} (${count} names withheld)`
+    }
+    return message
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Prompt construction (Meta-only; evidence passed in, never invented)
 // ---------------------------------------------------------------------------
@@ -480,10 +503,11 @@ export async function analyzeResearch(input = {}, options = {}) {
 
       const validation = validateAnalysis(data)
       if (!validation.valid) {
-        // Error count only: problem strings name our own fields, but model
-        // text is never reconstructed here.
-        console.error(`[recallguard] Meta AI output failed validation (${validation.errors.length} problems)`)
-        return { ok: false, aiStatus: 'unavailable', errorCode: META_AI_ERROR_CODE, analysis: null }
+        // Sanitized diagnostics only: field paths and rule names are our
+        // own vocabulary, but model-supplied property names are withheld.
+        const validationErrors = sanitizeValidationErrors(validation.errors)
+        console.error(`[recallguard] Meta AI output failed validation (${validationErrors.length} problems): ${validationErrors.join('; ')}`)
+        return { ok: false, aiStatus: 'unavailable', errorCode: META_AI_ERROR_CODE, analysis: null, validationErrors }
       }
 
       const latencyMs = Date.now() - started

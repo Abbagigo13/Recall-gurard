@@ -1,4 +1,6 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { walrusAggregatorStatusLabel } from './statusLabels';
+import LandingPage from './LandingPage';
 import {
   Brain,
   Shield,
@@ -17,6 +19,7 @@ import {
   ExternalLink,
   ChevronRight,
   ChevronDown,
+  ChevronLeft,
   Sliders,
   Award,
   Link as LinkIcon,
@@ -62,13 +65,91 @@ interface MetricsResponse {
   };
 }
 
+type ClaimType =
+  | 'verified_fact'
+  | 'unverified_claim'
+  | 'ai_interpretation'
+  | 'superseded_claim'
+  | 'research_plan'
+  | 'on_chain_observation'
+  | 'evidence_retrieval_error'
+  | 'recalled_memory'
+  | 'memory_search_result'
+  | 'evidence_gap'
+  | 'evidence_comparison';
+
 interface Claim {
   id: string;
   text: string;
-  type: 'verified_fact' | 'unverified_claim' | 'ai_interpretation' | 'superseded_claim';
+  type: ClaimType;
   source: string;
   verifiedAt?: string;
-  details?: Record<string, any>;
+  details?: Record<string, unknown>;
+}
+
+interface OnChainSuiData {
+  network: string;
+  provider: string;
+  operation: string;
+  evidenceStatus: string;
+  cryptographicallyVerified: boolean;
+  retrievedAt: string;
+  checkpointSequence?: string | null;
+  checkpointDigest?: string | null;
+  epoch?: string | number | null;
+  chainId?: string | null;
+}
+
+interface EvidenceComparison {
+  status: string;
+  reason: string;
+  comparedSessionId: string | null;
+  previousValue: string | null;
+  currentValue: string | null;
+}
+
+interface RevisionCandidate {
+  id: string;
+  status: string;
+  previousSessionId: string | null;
+  currentSessionId: string | null;
+  previousValue: string | null;
+  currentValue: string | null;
+}
+
+interface AiAnalysisContradiction {
+  claim: string;
+  against: string;
+  severity: 'low' | 'medium' | 'high';
+}
+
+interface AiAnalysis {
+  model: string;
+  provider: string;
+  subQuestions: string[];
+  interpretation: string;
+  contradictions: AiAnalysisContradiction[];
+  uncertainties: string[];
+  evidenceGaps: string[];
+  confidenceNote: string;
+}
+
+interface ResearchResponse {
+  session: ResearchSession;
+  storedMemory: MemoryItem | null;
+  walrusStoreResult: {
+    blobId: string;
+    aggregatorUrl: string;
+  } | null;
+  walrusStoreError: string | null;
+  onChainSuiData: OnChainSuiData | null;
+  onChainError: string | null;
+  evidenceComparison: EvidenceComparison | null;
+  liveDecision: null;
+  revisionCandidate: RevisionCandidate | null;
+  aiAnalysis: AiAnalysis | null;
+  aiStatus: string;
+  aiErrorCode: string | null;
 }
 
 interface ResearchSession {
@@ -83,6 +164,15 @@ interface ResearchSession {
   claims: Claim[];
   conclusion: string;
   learningDelta: string;
+  researchPlan?: { capability: string; requiresTatum: boolean };
+  onChainSuiData?: OnChainSuiData | null;
+  evidenceComparison?: EvidenceComparison | null;
+  revisionCandidate?: RevisionCandidate | null;
+  aiStatus?: string | null;
+  aiAnalysis?: AiAnalysis | null;
+  aiErrorCode?: string | null;
+  aiModel?: string | null;
+  aiProvider?: string | null;
 }
 
 interface MemoryItem {
@@ -128,6 +218,34 @@ interface TimelineItem {
   recalledMemoryIds: string[];
 }
 
+interface ConfigStatusMeta {
+  configured: boolean;
+  provider: string;
+  model: string;
+  baseUrl: string;
+  status: string;
+}
+
+interface ConfigStatus {
+  hasTatumKey: boolean;
+  hasWalrusSdk: boolean;
+  walrusPublisher: string;
+  walrusAggregator: string;
+  meta?: ConfigStatusMeta | null;
+}
+
+const NAV_TABS = [
+  { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { id: 'workspace', label: 'Research Workspace', icon: Search },
+  { id: 'memories', label: 'Memory Explorer', icon: Database },
+  { id: 'verification', label: 'Evidence Verification', icon: ShieldCheck },
+  { id: 'learning', label: 'Learning Engine', icon: Brain },
+  { id: 'timeline', label: 'Audit Timeline', icon: History },
+  { id: 'sdk', label: 'memwal SDK', icon: Code2 }
+] as const;
+
+type TabId = typeof NAV_TABS[number]['id'];
+
 interface HealthData {
   status: string;
   timestamp: string;
@@ -147,8 +265,7 @@ interface HealthData {
       aggregatorUrl: string;
       aggregatorStatus: string;
       aggregatorLatencyMs: number | null;
-      pythonPackage: string;
-      encoding: string;
+      storageWriteTested: boolean;
     };
   };
   counts: {
@@ -177,6 +294,63 @@ function DashboardSkeleton() {
   );
 }
 
+type BadgeFamily = 'brand' | 'success' | 'warning';
+
+function AggregatorBadge({ status }: { status?: string | null }) {
+  const { label, tone } = walrusAggregatorStatusLabel(status ?? undefined);
+  const frame =
+    tone === 'ok'
+      ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
+      : tone === 'warn'
+        ? 'border-utility-warning-200 bg-utility-warning-50 text-utility-warning-700'
+        : tone === 'error'
+          ? 'border-utility-error-200 bg-utility-error-50 text-utility-error-700'
+          : 'border-utility-gray-200 bg-utility-gray-50 text-utility-gray-700';
+  const dot =
+    tone === 'ok'
+      ? 'bg-success-primary'
+      : tone === 'warn'
+        ? 'bg-warning-primary'
+        : tone === 'error'
+          ? 'bg-error-primary'
+          : 'bg-gray-primary';
+  return (
+    <span className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium ${frame}`} title="Walrus aggregator probe status (live backend value)">
+      <span className={`size-2 rounded-full ${dot}`} />
+      Aggregator: {label}
+    </span>
+  );
+}
+
+function claimDisplay(type: string): { label: string; family: BadgeFamily; Icon: typeof HelpCircle } {
+  switch (type) {
+    case 'verified_fact':
+      return { label: 'Verified Fact (On-Chain / Spec)', family: 'success', Icon: CheckCircle2 };
+    case 'ai_interpretation':
+      return { label: 'Agent Synthesis', family: 'brand', Icon: Brain };
+    case 'superseded_claim':
+      return { label: 'Superseded Claim (Obsolete)', family: 'warning', Icon: AlertCircle };
+    case 'research_plan':
+      return { label: 'Research Plan', family: 'brand', Icon: FileText };
+    case 'on_chain_observation':
+      // Retrieved observation only: never presented as verified evidence.
+      return { label: 'Retrieved Observation — Not Verified', family: 'brand', Icon: Activity };
+    case 'evidence_retrieval_error':
+      return { label: 'Evidence Unavailable', family: 'warning', Icon: AlertTriangle };
+    case 'recalled_memory':
+      return { label: 'Recalled Memory', family: 'brand', Icon: Database };
+    case 'memory_search_result':
+      return { label: 'Memory Search Result', family: 'brand', Icon: Search };
+    case 'evidence_gap':
+      return { label: 'Evidence Gap', family: 'warning', Icon: HelpCircle };
+    case 'evidence_comparison':
+      return { label: 'Evidence Comparison', family: 'brand', Icon: TrendingUp };
+    case 'unverified_claim':
+    default:
+      return { label: 'Unverified Claim', family: 'brand', Icon: HelpCircle };
+  }
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'workspace' | 'memories' | 'verification' | 'learning' | 'timeline' | 'sdk'>('dashboard');
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -185,6 +359,13 @@ export default function App() {
     return saved === 'dark' ? 'dark' : 'light';
   });
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
+  // Minimal History-API routing: landing at /, full app at /dashboard.
+  // No router dependency; the server serves index.html for both paths.
+  const [entered, setEntered] = useState(
+    () => typeof window !== 'undefined' && window.location.pathname.startsWith('/dashboard')
+  );
   const [initialLoading, setInitialLoading] = useState(true);
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   
@@ -204,7 +385,10 @@ export default function App() {
   // Workspace form state
   const [researchQuery, setResearchQuery] = useState('');
   const [isExecuting, setIsExecuting] = useState(false);
-  const [researchResultData, setResearchResultData] = useState<any>(null);
+  const [researchResultData, setResearchResultData] = useState<ResearchResponse | null>(null);
+  const researchAbortRef = useRef<AbortController | null>(null);
+  const researchAbortReasonRef = useRef<'cancelled' | 'timeout' | null>(null);
+  const researchTimeoutRef = useRef<number | null>(null);
   const [researchNotice, setResearchNotice] = useState<string | null>(null);
 
   // Memory filter states
@@ -268,6 +452,38 @@ export default function App() {
       {
         label: 'Superseded claims',
         value: claims.filter(claim => claim.type === 'superseded_claim').length
+      },
+      {
+        label: 'Retrieved observations',
+        value: claims.filter(claim => claim.type === 'on_chain_observation').length
+      },
+      {
+        label: 'Evidence comparisons',
+        value: claims.filter(claim => claim.type === 'evidence_comparison').length
+      },
+      // Remaining deterministic types, each counted exactly once below.
+      // Plans are not claims, recall is not independent evidence,
+      // comparisons are not committed decisions, and errors/gaps are not
+      // successful verification — labels keep those distinctions.
+      {
+        label: 'Research plans',
+        value: claims.filter(claim => claim.type === 'research_plan').length
+      },
+      {
+        label: 'Recalled memories',
+        value: claims.filter(claim => claim.type === 'recalled_memory').length
+      },
+      {
+        label: 'Memory search results',
+        value: claims.filter(claim => claim.type === 'memory_search_result').length
+      },
+      {
+        label: 'Evidence gaps',
+        value: claims.filter(claim => claim.type === 'evidence_gap').length
+      },
+      {
+        label: 'Evidence errors',
+        value: claims.filter(claim => claim.type === 'evidence_retrieval_error').length
       }
     ];
 
@@ -341,13 +557,14 @@ export default function App() {
   // Load telemetry & health status
   const loadTelemetry = async () => {
     try {
-      const [hlthRes, metRes, sesRes, memRes, decRes, tlRes] = await Promise.all([
+      const [hlthRes, metRes, sesRes, memRes, decRes, tlRes, cfgRes] = await Promise.all([
         fetch('/api/recallguard/health').then(r => r.json()),
         fetch('/api/recallguard/metrics').then(r => r.json()),
         fetch('/api/recallguard/sessions').then(r => r.json()),
         fetch('/api/recallguard/memories').then(r => r.json()),
         fetch('/api/recallguard/decisions').then(r => r.json()),
-        fetch('/api/recallguard/timeline').then(r => r.json())
+        fetch('/api/recallguard/timeline').then(r => r.json()),
+        fetch('/api/recallguard/config-status').then(r => r.json()).catch(() => null)
       ]);
       setHealth(hlthRes);
       setMetrics(metRes);
@@ -355,8 +572,9 @@ export default function App() {
       setMemories(memRes);
       setDecisions(decRes);
       setTimeline(tlRes);
+      if (cfgRes) setConfigStatus(cfgRes);
       if (sesRes && sesRes.length > 0 && !selectedSession) {
-        setSelectedSession(sesRes[0]);
+        void handleSelectSession(sesRes[0]);
       }
     } catch (e) {
       console.error('Failed to load initial telemetry:', e);
@@ -366,13 +584,68 @@ export default function App() {
     }
   };
 
+  // Landing page loads zero API data: telemetry starts only inside the app.
   useEffect(() => {
+    if (!entered) return;
     loadTelemetry();
     fetch('/api/recallguard/walrus/sdk-spec')
       .then(r => r.json())
       .then(setSdkSpec)
       .catch(console.error);
+  }, [entered]);
+
+  // Browser back/forward between landing (/) and app (/dashboard).
+  useEffect(() => {
+    const sync = () => {
+      setEntered(window.location.pathname.startsWith('/dashboard'));
+    };
+    window.addEventListener('popstate', sync);
+    return () => window.removeEventListener('popstate', sync);
   }, []);
+
+  const enterDashboard = () => {
+    window.history.pushState({}, '', '/dashboard');
+    setEntered(true);
+  };
+
+  // Abort any in-flight research request when leaving the page.
+  useEffect(() => {
+    return () => { researchAbortRef.current?.abort(); };
+  }, []);
+
+  const refreshSessionList = async () => {
+    try {
+      const sesRes = await fetch('/api/recallguard/sessions').then(r => r.json());
+      setSessions(sesRes);
+    } catch (e) {
+      console.error('Failed to refresh session list:', e);
+    }
+  };
+
+  // Select a session and enrich it with its persisted historical AI status.
+  // The detail endpoint is a pure read: it never runs inference and never
+  // writes. List rows carry no AI fields, so they stay lightweight.
+  const handleSelectSession = async (session: ResearchSession) => {
+    setSelectedSession(session);
+    try {
+      const detail: ResearchSession = await fetch(
+        `/api/recallguard/sessions/${encodeURIComponent(session.id)}`
+      ).then(r => r.json());
+      if (detail && detail.id === session.id) {
+        setSelectedSession(prev => (prev && prev.id === detail.id ? { ...prev, ...detail } : prev));
+      }
+    } catch (e) {
+      console.error('Failed to load session AI detail:', e);
+    }
+  };
+
+  // Cancel the waiting research request. Aborting the browser request does
+  // NOT roll back the server: the session may already be persisted or still
+  // processing. Never retry automatically — refresh the list first.
+  const handleCancelResearch = async () => {
+    researchAbortReasonRef.current = 'cancelled';
+    researchAbortRef.current?.abort();
+  };
 
   // Handle new research execution
   const handleExecuteResearch = async (e: React.FormEvent) => {
@@ -382,6 +655,17 @@ export default function App() {
       setToast({ type: 'error', message: 'Research question is too short.' });
       return;
     }
+    if (researchAbortRef.current) return;
+
+    const controller = new AbortController();
+    researchAbortRef.current = controller;
+    researchAbortReasonRef.current = null;
+    // Client-side timeout: research fans out to paid external services and
+    // can legitimately take minutes. Abort only the wait, never retry.
+    researchTimeoutRef.current = window.setTimeout(() => {
+      researchAbortReasonRef.current = 'timeout';
+      controller.abort();
+    }, 180000);
 
     setIsExecuting(true);
     setResearchNotice(null);
@@ -391,14 +675,16 @@ export default function App() {
       const res = await fetch('/api/recallguard/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: researchQuery.trim() })
+        body: JSON.stringify({ question: researchQuery.trim() }),
+        signal: controller.signal
       });
-      const data = await res.json();
+      const data: ResearchResponse & { error?: string } = await res.json();
       if (res.ok) {
         setSessions(prev => [data.session, ...prev]);
         setSelectedSession(data.session);
-        if (data.storedMemory) {
-          setMemories(prev => [data.storedMemory, ...prev]);
+        const storedMemory = data.storedMemory;
+        if (storedMemory) {
+          setMemories(prev => [storedMemory, ...prev]);
         }
         setResearchResultData(data);
         setToast({ type: 'success', message: 'Research session completed.' });
@@ -417,9 +703,24 @@ export default function App() {
         setToast({ type: 'error', message: data.error || 'Research request failed.' });
       }
     } catch (err: any) {
-      setResearchNotice(err.message || 'Network error executing research session');
-      setToast({ type: 'error', message: err.message || 'Network error executing research session.' });
+      if (controller.signal.aborted) {
+        const reason = researchAbortReasonRef.current === 'timeout' ? 'timed out' : 'cancelled';
+        setResearchNotice(
+          `Research request ${reason} after waiting. The server may still have completed and persisted the session — the session list was refreshed. Check it before submitting again; the request was not retried.`
+        );
+        setToast({ type: 'info', message: `Research request ${reason}; session list refreshed.` });
+        await refreshSessionList();
+      } else {
+        setResearchNotice(err.message || 'Network error executing research session');
+        setToast({ type: 'error', message: err.message || 'Network error executing research session.' });
+      }
     } finally {
+      if (researchTimeoutRef.current !== null) {
+        window.clearTimeout(researchTimeoutRef.current);
+        researchTimeoutRef.current = null;
+      }
+      researchAbortRef.current = null;
+      researchAbortReasonRef.current = null;
       setIsExecuting(false);
     }
   };
@@ -568,38 +869,146 @@ const selectedRecalledMemories = selectedSession
     filteredSessions.some(s => s.id === selectedSession.id);
 
   if (!selectionIsVisible) {
-    setSelectedSession(filteredSessions[0] ?? null);
+    if (filteredSessions.length > 0) {
+      void handleSelectSession(filteredSessions[0]);
+    } else {
+      setSelectedSession(null);
+    }
   }
 }, [provenanceFilter, sessions]);
 
+  const activeTabLabel = NAV_TABS.find(tab => tab.id === activeTab)?.label ?? 'Dashboard';
+  const tatumStatus = health
+    ? (health.integrations.tatumSuiRpc.configured ? health.integrations.tatumSuiRpc.status : 'Not configured')
+    : 'Unknown';
+  const walrusStatus = walrusAggregatorStatusLabel(health?.integrations.walrusMemory.aggregatorStatus).label;
+  const metaStatus = configStatus?.meta
+    ? (configStatus.meta.configured ? `${configStatus.meta.model} · ${configStatus.meta.status}` : 'No key')
+    : 'Unknown';
+
+  // Landing first: no dashboard data, sidebar, or header renders here.
+  if (!entered) {
+    return <LandingPage onEnter={enterDashboard} />;
+  }
+
   return (
-    <div className="min-h-screen bg-primary text-primary font-sans flex flex-col">
+    <div className="min-h-screen bg-primary text-primary font-sans">
+      {/* Mobile drawer overlay */}
+      {mobileNavOpen && (
+        <div className="app-drawer-overlay lg:hidden" onClick={() => setMobileNavOpen(false)} aria-hidden="true" />
+      )}
+      {/* LEFT SIDEBAR NAVIGATION — one shared shell for all seven pages */}
+      <aside className={`app-sidebar${sidebarCollapsed ? ' is-collapsed' : ''}${mobileNavOpen ? ' is-open' : ''}`} aria-label="Primary navigation">
+        <div className="app-sidebar-brand">
+          <span className="app-sidebar-mark">
+            <Shield className="size-5 shrink-0" aria-hidden="true" />
+          </span>
+          <span className="sidebar-label">
+            <span className="app-sidebar-title">RecallGuard</span>
+            <span className="app-sidebar-caption">Tatum × Walrus</span>
+          </span>
+          <button type="button" className="app-sidebar-close lg:hidden" onClick={() => setMobileNavOpen(false)} aria-label="Close navigation">
+            <X className="size-5" />
+          </button>
+        </div>
+
+        <nav className="app-sidebar-nav">
+          <p className="app-sidebar-heading sidebar-label">Navigate</p>
+          {NAV_TABS.map(tab => {
+            const Icon = tab.icon;
+            const isActive = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => { setActiveTab(tab.id); setMobileNavOpen(false); }}
+                aria-current={isActive ? 'page' : undefined}
+                className={`app-sidebar-item${isActive ? ' is-active' : ''}`}
+              >
+                <Icon className="size-4 shrink-0" aria-hidden="true" />
+                <span className="sidebar-label">{tab.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="app-sidebar-block sidebar-label">
+          <p className="app-sidebar-heading">Data Provenance</p>
+          <label className="app-sidebar-field-label" htmlFor="provenance-filter">
+            Display records
+          </label>
+          <select
+            id="provenance-filter"
+            value={provenanceFilter}
+            onChange={e => setProvenanceFilter(e.target.value as any)}
+            className="app-sidebar-select"
+          >
+            <option value="all">All records</option>
+            <option value="live_production">Live Confirmed Only</option>
+            <option value="demo_seed">Demo Historical Seeds</option>
+          </select>
+        </div>
+
+        <div className="app-sidebar-block sidebar-label">
+          <p className="app-sidebar-heading">Infrastructure</p>
+          <ul className="app-sidebar-infra">
+            <li><span>Tatum</span><span>{tatumStatus}</span></li>
+            <li><span>Walrus</span><span>{walrusStatus}</span></li>
+            <li><span>Meta</span><span>{metaStatus}</span></li>
+          </ul>
+        </div>
+
+        <div className="app-sidebar-foot sidebar-label">
+          <p>RecallGuard Research Engine</p>
+          <p>Tatum × Walrus Infrastructure</p>
+        </div>
+      </aside>
+
+      {/* Main column: header, content, footer */}
+      <div className={`app-shell-col${sidebarCollapsed ? ' is-collapsed' : ''}`}>
       {/* Top Header */}
       <header className="app-header border-b border-secondary bg-primary px-xl py-md sticky top-0 z-50">
         <div className="w-full max-w-none mx-0 flex items-center justify-between gap-md">
-          <div className="flex items-center gap-md">
-            <span className="flex size-10 items-center justify-center rounded-full bg-secondary">
-              <Shield className="size-5 shrink-0 text-fg-secondary" aria-hidden="true" />
-            </span>
-            <div>
+          <div className="flex items-center gap-md min-w-0">
+            <button type="button" className="mobile-menu-toggle lg:hidden" onClick={() => setMobileNavOpen(open => !open)} aria-expanded={mobileNavOpen} aria-label={mobileNavOpen ? 'Close navigation' : 'Open navigation'}>
+              {mobileNavOpen ? <X className="size-5" /> : <Menu className="size-5" />}
+            </button>
+            <button type="button" className="sidebar-collapse-toggle" onClick={() => setSidebarCollapsed(collapsed => !collapsed)} aria-expanded={!sidebarCollapsed} aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
+              {sidebarCollapsed ? <ChevronRight className="size-5" /> : <ChevronLeft className="size-5" />}
+            </button>
+            <div className="min-w-0">
               <div className="flex items-center gap-sm">
                 <span className="text-heading-xs font-semibold text-primary tracking-tight">RecallGuard</span>
                 <span className="inline-flex items-center gap-xs rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
                   Tatum × Walrus Hackathon
                 </span>
               </div>
-              <p className="text-xs text-tertiary">Autonomous AI Research Agent with Persistent Memory & Verifiable Sui Data</p>
+              <p className="text-xs text-tertiary truncate">{activeTabLabel}</p>
             </div>
           </div>
 
           {/* Integration Live Status Badges */}
           <div className="header-actions flex items-center gap-sm">
+            <span className="hidden xl:inline-flex items-center gap-sm">
+              <span className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium ${
+                tatumStatus === 'connected'
+                  ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
+                  : 'border-utility-warning-200 bg-utility-warning-50 text-utility-warning-700'
+              }`} title="Tatum Sui gRPC status (live backend value)">
+                <span className={`size-2 rounded-full ${tatumStatus === 'connected' ? 'bg-success-primary' : 'bg-warning-primary'}`} />
+                Tatum: {tatumStatus}
+              </span>
+              <span className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium ${
+                configStatus?.meta?.configured
+                  ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
+                  : 'border-utility-warning-200 bg-utility-warning-50 text-utility-warning-700'
+              }`} title="Meta model configuration (live backend value)">
+                <span className={`size-2 rounded-full ${configStatus?.meta?.configured ? 'bg-success-primary' : 'bg-warning-primary'}`} />
+                Meta: {configStatus?.meta?.model ?? metaStatus}
+              </span>
+            </span>
             <button type="button" onClick={() => setTheme(current => current === 'dark' ? 'light' : 'dark')} className="theme-toggle" aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>
               {theme === 'dark' ? <Sun className="size-4" aria-hidden="true" /> : <Moon className="size-4" aria-hidden="true" />}
               <span className="theme-toggle-label">{theme === 'dark' ? 'Light' : 'Dark'}</span>
-            </button>
-            <button type="button" className="mobile-menu-toggle" onClick={() => setMobileNavOpen(open => !open)} aria-expanded={mobileNavOpen} aria-label={mobileNavOpen ? 'Close navigation' : 'Open navigation'}>
-              {mobileNavOpen ? <X className="size-5" /> : <Menu className="size-5" />}
             </button>
             
             {/* Walrus Publisher Status */}
@@ -618,104 +1027,17 @@ const selectedRecalledMemories = selectedSession
               }
             </span>
 
-            {/* Walrus Aggregator Status */}
-            <span className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium ${
-              health?.integrations.walrusMemory.aggregatorStatus === 'reachable'
-                ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
-                : 'border-utility-error-200 bg-utility-error-50 text-utility-error-700'
-            }`}>
-              <span className={`size-2 rounded-full ${
-                health?.integrations.walrusMemory.aggregatorStatus === 'reachable'
-                  ? 'bg-success-primary'
-                  : 'bg-error-primary'
-              }`} />
-              Aggregator: {
-                health?.integrations.walrusMemory.aggregatorStatus === 'reachable'
-                  ? 'Reachable'
-                  : health?.integrations.walrusMemory.aggregatorStatus === 'checking'
-                    ? 'Checking'
-                    : health?.integrations.walrusMemory.aggregatorStatus || 'Unknown'
-              }
-            </span>
+            {/* Walrus Aggregator Status (live backend probe value, never fabricated) */}
+            <AggregatorBadge status={health?.integrations.walrusMemory.aggregatorStatus} />
           </div>
         </div>
 
         
       </header>
-{/* RIGHT SIDEBAR NAVIGATION */}
-<aside className="fixed right-0 top-20 bottom-0 z-40 w-64 border-l border-secondary bg-primary p-md overflow-y-auto hidden lg:block">
-  <div className="space-y-lg">
-
-    <div>
-      <p className="px-sm mb-sm text-xs font-semibold uppercase tracking-wider text-tertiary">
-        Workspace
-      </p>
-
-      <nav className="space-y-1">
-        {[
-          { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-          { id: 'workspace', label: 'Research Workspace', icon: Search },
-          { id: 'memories', label: 'Memory Explorer', icon: Database },
-          { id: 'verification', label: 'Evidence Verification', icon: ShieldCheck },
-          { id: 'learning', label: 'Learning Engine', icon: Brain },
-          { id: 'timeline', label: 'Audit Timeline', icon: History },
-          { id: 'sdk', label: 'memwal SDK', icon: Code2 }
-        ].map(tab => {
-          const Icon = tab.icon;
-
-          return (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id as any)}
-              className={`w-full flex items-center gap-sm rounded-lg px-md py-sm text-sm font-medium transition-colors ${
-                activeTab === tab.id
-                  ? 'bg-brand-primary/10 text-brand-primary border border-brand-primary/20'
-                  : 'text-tertiary hover:text-primary hover:bg-secondary'
-              }`}
-            >
-              <Icon className="size-4 shrink-0" />
-              {tab.label}
-            </button>
-          );
-        })}
-      </nav>
-    </div>
-
-    <div className="border-t border-secondary pt-lg">
-      <p className="px-sm mb-sm text-xs font-semibold uppercase tracking-wider text-tertiary">
-        Data Provenance
-      </p>
-
-      <label className="block px-sm mb-xs text-xs text-secondary">
-        Display records
-      </label>
-
-      <select
-        value={provenanceFilter}
-        onChange={e => setProvenanceFilter(e.target.value as any)}
-        className="w-full rounded-lg bg-secondary border border-primary px-sm py-sm text-xs text-primary"
-      >
-        <option value="all">All records</option>
-        <option value="live_production">Live Confirmed Only</option>
-        <option value="demo_seed">Demo Historical Seeds</option>
-      </select>
-    </div>
-
-    <div className="border-t border-secondary pt-lg">
-      <p className="px-sm text-xs text-tertiary">
-        RecallGuard Research Engine
-      </p>
-      <p className="px-sm mt-xs text-xs text-quaternary">
-        Tatum × Walrus Infrastructure
-      </p>
-    </div>
-
-  </div>
-</aside>
       {/* Main Content Area */}
       <main
   id="main-content"
-  className="app-main flex-1 w-full max-w-none p-xl pr-72 space-y-xl"
+  className="app-main flex-1 w-full max-w-none p-xl space-y-xl"
 >
         {initialLoading && <DashboardSkeleton />}
         {!initialLoading && <>
@@ -780,11 +1102,13 @@ const selectedRecalledMemories = selectedSession
                   </p>
                   <div className="flex flex-wrap items-center gap-sm">
                     <span className={`text-xs font-medium ${
-                      health?.integrations.walrusMemory.aggregatorStatus === 'reachable'
+                      walrusAggregatorStatusLabel(health?.integrations.walrusMemory.aggregatorStatus).tone === 'ok'
                         ? 'text-utility-success-700'
-                        : 'text-utility-error-700'
+                        : walrusAggregatorStatusLabel(health?.integrations.walrusMemory.aggregatorStatus).tone === 'warn'
+                          ? 'text-utility-warning-700'
+                          : 'text-utility-error-700'
                     }`}>
-                      Status: {health?.integrations.walrusMemory.aggregatorStatus || 'Unknown'}
+                      Status: {walrusAggregatorStatusLabel(health?.integrations.walrusMemory.aggregatorStatus).label}
                     </span>
                     <span className="text-xs text-tertiary">
                       {health?.integrations.walrusMemory.aggregatorLatencyMs != null
@@ -1131,7 +1455,7 @@ const selectedRecalledMemories = selectedSession
                     <div
                       key={s.id}
                       onClick={() => {
-                        setSelectedSession(s);
+                        void handleSelectSession(s);
                         setActiveTab('workspace');
                       }}
                       className="p-md rounded-md bg-secondary hover:bg-secondary-hover border border-secondary transition-colors cursor-pointer space-y-xs"
@@ -1297,7 +1621,8 @@ const selectedRecalledMemories = selectedSession
                           {health?.integrations.walrusMemory.aggregatorUrl || 'Not configured'}
                         </p>
                         <p className="text-tertiary mt-xs">
-                          Status: {health?.integrations.walrusMemory.aggregatorStatus || 'Unknown'}
+                          Status: {walrusAggregatorStatusLabel(health?.integrations.walrusMemory.aggregatorStatus).label}
+                          {' '}— probe responses of 200/404 mean accepted; other 4xx mean reachable but inconclusive, never healthy.
                         </p>
                       </div>
                     </div>
@@ -1350,6 +1675,16 @@ const selectedRecalledMemories = selectedSession
                       </>
                     )}
                   </button>
+                  {isExecuting && (
+                    <button
+                      type="button"
+                      onClick={handleCancelResearch}
+                      className="inline-flex items-center gap-sm rounded-lg border border-secondary bg-secondary px-lg py-sm text-sm font-semibold text-secondary hover:bg-secondary-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
+                    >
+                      <X className="size-4 shrink-0" aria-hidden="true" />
+                      <span>Cancel Request</span>
+                    </button>
+                  )}
                 </div>
                 <p className="text-xs text-tertiary">
                   Attempts live write to Walrus publisher endpoint and runs read-only Tatum Sui RPC query if configured.
@@ -1398,6 +1733,72 @@ const selectedRecalledMemories = selectedSession
                   <button onClick={() => setResearchNotice(null)} className="text-xs text-utility-brand-600 font-bold">&times;</button>
                 </div>
               )}
+
+              {/* AI interpretation panel — model output only, never verified evidence */}
+              {researchResultData && (
+                <div className="rounded-xl border border-secondary bg-primary p-xl shadow-xs space-y-md">
+                  <div className="flex items-center gap-sm border-b border-secondary pb-md">
+                    <Sparkles className="size-4 shrink-0 text-fg-brand-primary" aria-hidden="true" />
+                    <h3 className="text-heading-xs font-semibold text-primary">
+                      AI Interpretation — Not Verified Evidence
+                    </h3>
+                    <span className="inline-flex items-center rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
+                      {researchResultData.aiStatus}
+                    </span>
+                  </div>
+                  {researchResultData.aiAnalysis ? (
+                    <div className="space-y-md">
+                      <p className="text-xs text-tertiary">
+                        Provider: <strong className="text-secondary">{researchResultData.aiAnalysis.provider}</strong>
+                        {' '}· Model: <strong className="text-secondary">{researchResultData.aiAnalysis.model}</strong>
+                      </p>
+                      <p className="text-sm text-primary font-medium leading-relaxed">
+                        {researchResultData.aiAnalysis.interpretation}
+                      </p>
+                      {researchResultData.aiAnalysis.contradictions.length > 0 && (
+                        <div className="space-y-xxs">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-brand-primary">Contradictions</p>
+                          {researchResultData.aiAnalysis.contradictions.map((item, index) => (
+                            <p key={index} className="text-sm text-secondary">
+                              “{item.claim}” vs “{item.against}”{' '}
+                              <span className="text-xs text-tertiary">({item.severity})</span>
+                            </p>
+                          ))}
+                        </div>
+                      )}
+                      {researchResultData.aiAnalysis.uncertainties.length > 0 && (
+                        <div className="space-y-xxs">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-brand-primary">Uncertainties</p>
+                          {researchResultData.aiAnalysis.uncertainties.map((item, index) => (
+                            <p key={index} className="text-sm text-secondary">• {item}</p>
+                          ))}
+                        </div>
+                      )}
+                      {researchResultData.aiAnalysis.evidenceGaps.length > 0 && (
+                        <div className="space-y-xxs">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-brand-primary">Evidence Gaps</p>
+                          {researchResultData.aiAnalysis.evidenceGaps.map((item, index) => (
+                            <p key={index} className="text-sm text-secondary">• {item}</p>
+                          ))}
+                        </div>
+                      )}
+                      <p className="text-xs text-tertiary">
+                        Confidence note: {researchResultData.aiAnalysis.confidenceNote}
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-secondary">
+                      AI analysis unavailable
+                      {researchResultData.aiErrorCode ? ` (${researchResultData.aiErrorCode})` : ''}.
+                      {' '}The deterministic research conclusion above remains the authoritative result.
+                    </p>
+                  )}
+                  <p className="text-xs text-tertiary border-t border-secondary pt-xs">
+                    Model output is interpretation only. It is never cryptographically verified
+                    and cannot revise beliefs or supersede stored memories.
+                  </p>
+                </div>
+              )}
             </form>
 
             {/* Session Inspector Grid */}
@@ -1443,23 +1844,7 @@ const selectedRecalledMemories = selectedSession
                   {selectedSession ? (
                     <div className="space-y-md">
                       {selectedSession.claims.map(claim => {
-                        let badgeFamily = 'brand';
-                        let typeLabel = 'Unverified Claim';
-                        let IconComponent = HelpCircle;
-
-                        if (claim.type === 'verified_fact') {
-                          badgeFamily = 'success';
-                          typeLabel = 'Verified Fact (On-Chain / Spec)';
-                          IconComponent = CheckCircle2;
-                        } else if (claim.type === 'ai_interpretation') {
-                          badgeFamily = 'brand';
-                          typeLabel = 'Agent Synthesis';
-                          IconComponent = Brain;
-                        } else if (claim.type === 'superseded_claim') {
-                          badgeFamily = 'warning';
-                          typeLabel = 'Superseded Claim (Obsolete)';
-                          IconComponent = AlertCircle;
-                        }
+                        const { label: typeLabel, family: badgeFamily, Icon: IconComponent } = claimDisplay(claim.type);
 
                         return (
                           <div key={claim.id} className="p-md rounded-md bg-secondary border border-secondary space-y-xs">
@@ -1477,8 +1862,11 @@ const selectedRecalledMemories = selectedSession
                             </p>
                             <div className="flex items-center justify-between text-xs text-tertiary pt-xxs border-t border-secondary">
                               <span>Source: <strong className="text-secondary">{claim.source}</strong></span>
-                              {claim.verifiedAt && (
+                              {claim.verifiedAt && claim.type === 'verified_fact' && (
                                 <span>Verified: {new Date(claim.verifiedAt).toLocaleTimeString()}</span>
+                              )}
+                              {claim.verifiedAt && claim.type === 'on_chain_observation' && (
+                                <span>Retrieved: {new Date(claim.verifiedAt).toLocaleTimeString()}</span>
                               )}
                             </div>
                           </div>
@@ -1502,6 +1890,42 @@ const selectedRecalledMemories = selectedSession
                           </p>
                         </div>
                       </div>
+
+                      {/* Historical AI interpretation — persisted record only, never re-run */}
+                      {selectedSession.aiStatus !== undefined && selectedSession.aiStatus !== null && (
+                        <div className="p-md rounded-md bg-secondary border border-secondary space-y-xs">
+                          <div className="flex items-center gap-xs">
+                            <Sparkles className="size-4 shrink-0 text-fg-quaternary" aria-hidden="true" />
+                            <span className="text-xs font-semibold uppercase tracking-wider text-brand-primary">
+                              Historical AI Interpretation
+                            </span>
+                            <span className="text-xs text-tertiary">({selectedSession.aiStatus})</span>
+                          </div>
+                          {selectedSession.aiAnalysis ? (
+                            <div className="space-y-xs">
+                              <p className="text-xs text-secondary">
+                                {selectedSession.aiModel} via {selectedSession.aiProvider}
+                              </p>
+                              <p className="text-sm text-primary font-medium leading-relaxed">
+                                {selectedSession.aiAnalysis.interpretation}
+                              </p>
+                              <p className="text-xs text-tertiary">
+                                {selectedSession.aiAnalysis.confidenceNote}
+                              </p>
+                            </div>
+                          ) : (
+                            <p className="text-xs text-secondary">
+                              {selectedSession.aiStatus === 'not_run'
+                                ? 'No AI analysis was recorded for this session.'
+                                : `AI analysis ${selectedSession.aiStatus}${selectedSession.aiErrorCode ? ` (${selectedSession.aiErrorCode})` : ''}. The deterministic conclusion above remains authoritative.`}
+                            </p>
+                          )}
+                          <p className="text-xs text-tertiary">
+                            Model output is interpretation only — never verified evidence and
+                            never a committed belief revision.
+                          </p>
+                        </div>
+                      )}
                     </div>
                   ) : (
                     <div className="py-xl text-center text-sm text-tertiary">
@@ -1576,7 +2000,7 @@ const selectedRecalledMemories = selectedSession
                     {filteredSessions.map(s => (
                       <button
                         key={s.id}
-                        onClick={() => setSelectedSession(s)}
+                        onClick={() => handleSelectSession(s)}
                         className={`w-full text-left p-sm rounded-md text-xs transition-colors flex items-center justify-between ${
                           selectedSession?.id === s.id
                             ? 'bg-brand-solid text-primary-on-brand font-semibold'
@@ -2267,6 +2691,7 @@ const selectedRecalledMemories = selectedSession
           <div>Read-Only Cryptographic Verification • No Private Key Signatures Required</div>
         </div>
       </footer>
+      </div>
     </div>
   );
 }

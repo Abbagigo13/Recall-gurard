@@ -1,10 +1,13 @@
 import { Router } from 'express'
 import { tatumApiBase } from '../tatum-client.mjs'
+import { requireDemoAuth } from '../demo-auth.mjs'
 
 const router = Router()
 
 // Health check — a present key says nothing about egress, so make a real request.
-router.get('/status', async (_req, res) => {
+// Protected: every call leaves the process for a live network request, so
+// anonymous callers must not be able to trigger it at will.
+router.get('/status', requireDemoAuth(), async (_req, res) => {
   if (!process.env.TATUM_API_KEY) return res.json({ status: 'no-api-key' })
   try {
     // Any HTTP response proves the request left the pod; the status code doesn't matter.

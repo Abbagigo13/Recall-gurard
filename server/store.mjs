@@ -856,6 +856,21 @@ function memoryStore(db, dbPath) {
 
     close() {
       db.close()
+    },
+
+    // Flush the WAL sidecar into the main database image. Safe to call
+    // during graceful shutdown after the HTTP layer stopped accepting
+    // requests: no new writes can arrive, in-flight ones already drained.
+    // Never throws; reports success so the shutdown path can log safely
+    // without raw driver detail.
+    checkpoint() {
+      try {
+        db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+        return true
+      } catch (error) {
+        console.error(`[recallguard] shutdown checkpoint failed: ${error.message}`)
+        return false
+      }
     }
   }
 }
@@ -893,6 +908,7 @@ function degradedMemoryStore(reason) {
     backupDatabase: () => {
       throw new Error('Backups require SQLite file storage.')
     },
+    checkpoint: () => false,
     close() {}
   }
 }

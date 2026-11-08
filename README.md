@@ -5,6 +5,25 @@
 
 ---
 
+## 0. Judges' Guide — Explore & Test in 5 Minutes
+
+Run it: `npm install && npm run dev`, then open `http://localhost:3000`.
+
+1. **Landing page** → click **Enter Dashboard**. No login needed to look around.
+2. **Dashboard tab** — check the Tatum Sui RPC and Walrus Memory status badges, plus live metrics (sessions, memories, verified facts). If API keys are not configured, badges honestly report `Not configured` instead of fake data.
+3. **Research Workspace tab** — submit a question (e.g. "What is the current Sui reference gas price?"). Open the created session to see recalled memories, evaluated claims (`verified_fact` vs `unverified_claim` vs `ai_interpretation`), and the learning log when on-chain facts override earlier claims.
+4. **Evidence Verification tab** — run a read-only Sui RPC call (try `sui_getLatestCheckpointSequenceNumber` or `suix_getReferenceGasPrice`). No wallet, no signing, no private keys.
+5. **Memory Explorer tab** — search memories, filter by category, inspect a Walrus blob id.
+6. **Learning Engine + Audit Timeline tabs** — see why conclusions changed and the full session → memory → decision provenance chain.
+7. **memwal SDK tab** — the Walrus Memory Python SDK integration spec (`/api/recallguard/walrus/sdk-spec`).
+8. **Writes need the demo passphrase**: research/memory/RPC writes return `AUTH_REQUIRED` until unlocked via the passphrase box in the dashboard header. Ask the host for the passphrase, or set your own locally with `RECALLGUARD_DEMO_PASSPHRASE=your-phrase` in `.env` before starting the server.
+9. **API spot-checks** (no auth needed): `/api/recallguard/health`, `/api/recallguard/metrics`, `/api/recallguard/config-status`, `/api/recallguard/sessions`, `/api/recallguard/timeline`.
+10. **Tests**: `npm test` (offline, scratch DB in `/tmp`) and `npm run typecheck`.
+
+What to judge: memories persist across sessions (SQLite + Walrus blob ids), claims are verified against live Tatum Sui RPC rather than asserted, and belief revisions are logged with reasons — not silent edits.
+
+---
+
 ## 1. Executive Summary
 
 RecallGuard is a production-grade AI research engine that learns across iterative research sessions, preserves evidence in persistent decentralized memory, and dynamically refines its conclusions when verifiable on-chain facts contradict prior assumptions.
@@ -80,17 +99,17 @@ RecallGuard implements memory integration tailored for the official Walrus Memor
    npm install
    ```
 
-2. **Configure Environment Variables**:
+2. **Configure Environment Variables** (all optional for a read-only look-around):
 
-   ```bash
-   cp .env.example .env
-   ```
-
-   Add your Tatum API key:
+   Create a `.env` file in the project root (there is no `.env.example`; `.env` is gitignored):
 
    ```env
    TATUM_API_KEY=your_tatum_api_key_here
+   META_API_KEY=your_meta_api_key_here
+   RECALLGUARD_DEMO_PASSPHRASE=your-demo-phrase
    ```
+
+   Without keys the app still runs — status badges report `Not configured` and AI/RPC features degrade gracefully instead of failing.
 
 3. **Run the Application**:
 

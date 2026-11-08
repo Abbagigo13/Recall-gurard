@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { walrusAggregatorStatusLabel } from './statusLabels';
 import LandingPage from './LandingPage';
+import DemoAccess from './DemoAccess';
+import { demoFetch, getAuthStatus, AUTH_REQUIRED } from './demoAuth';
 import {
   Brain,
   Shield,
@@ -368,6 +370,8 @@ export default function App() {
   );
   const [initialLoading, setInitialLoading] = useState(true);
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
+  // Demo write access: null = unchecked, false = locked, true = unlocked.
+  const [demoAuthed, setDemoAuthed] = useState<boolean | null>(null);
   
   // Provenance filter: 'all' | 'live_production' | 'demo_seed'
   const [provenanceFilter, setProvenanceFilter] = useState<'all' | 'live_production' | 'demo_seed'>('all');
@@ -587,6 +591,7 @@ export default function App() {
   // Landing page loads zero API data: telemetry starts only inside the app.
   useEffect(() => {
     if (!entered) return;
+    getAuthStatus().then(setDemoAuthed).catch(() => setDemoAuthed(false));
     loadTelemetry();
     fetch('/api/recallguard/walrus/sdk-spec')
       .then(r => r.json())
@@ -672,13 +677,19 @@ export default function App() {
     setResearchResultData(null);
 
     try {
-      const res = await fetch('/api/recallguard/sessions', {
+      const res = await demoFetch('/api/recallguard/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: researchQuery.trim() }),
         signal: controller.signal
       });
-      const data: ResearchResponse & { error?: string } = await res.json();
+      const data: ResearchResponse & { error?: string; code?: string } = await res.json();
+      if (res.status === 401 && data.code === AUTH_REQUIRED) {
+        setDemoAuthed(false);
+        setResearchNotice('Demo access required — unlock with the demo passphrase in the header, then retry.');
+        setToast({ type: 'error', message: 'Demo access required.' });
+        return;
+      }
       if (res.ok) {
         setSessions(prev => [data.session, ...prev]);
         setSelectedSession(data.session);
@@ -738,7 +749,7 @@ export default function App() {
     setMemoryStoreStatusMsg(null);
 
     try {
-      const res = await fetch('/api/recallguard/memories', {
+      const res = await demoFetch('/api/recallguard/memories', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -749,6 +760,15 @@ export default function App() {
         })
       });
       const data = await res.json();
+      if (res.status === 401 && data.code === AUTH_REQUIRED) {
+        setDemoAuthed(false);
+        setMemoryStoreStatusMsg({
+          type: 'error',
+          text: 'Demo access required — unlock with the demo passphrase in the header, then retry.'
+        });
+        setToast({ type: 'error', message: 'Demo access required.' });
+        return;
+      }
       if (res.ok && data.success) {
         setMemories(prev => [data.memory, ...prev]);
         setToast({ type: 'success', message: 'Memory stored successfully.' });
@@ -785,8 +805,16 @@ export default function App() {
     setInspectBlobData(null);
 
     try {
-      const res = await fetch(`/api/recallguard/memories/walrus/${encodeURIComponent(blobId)}`);
+      const res = await fetch(`/api/recallguard/memories/walrus/${encodeURIComponent(blobId)}`, {
+        credentials: 'include'
+      });
       const data = await res.json();
+      if (res.status === 401 && data.code === AUTH_REQUIRED) {
+        setDemoAuthed(false);
+        setInspectBlobData({ error: 'Demo access required — unlock with the demo passphrase in the header, then retry.' });
+        setToast({ type: 'error', message: 'Demo access required.' });
+        return;
+      }
       setInspectBlobData(data);
     } catch (err: any) {
       setInspectBlobData({ error: err.message });
@@ -812,7 +840,7 @@ export default function App() {
     }
 
     try {
-      const res = await fetch('/api/recallguard/sui/rpc', {
+      const res = await demoFetch('/api/recallguard/sui/rpc', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -822,6 +850,12 @@ export default function App() {
         })
       });
       const data = await res.json();
+      if (res.status === 401 && data.code === AUTH_REQUIRED) {
+        setDemoAuthed(false);
+        setRpcError('Demo access required — unlock with the demo passphrase in the header, then retry.');
+        setToast({ type: 'error', message: 'Demo access required.' });
+        return;
+      }
       if (res.ok) {
         setRpcResult(data);
         setToast({ type: 'success', message: 'RPC request completed.' });
@@ -1006,6 +1040,7 @@ const selectedRecalledMemories = selectedSession
                 Meta: {configStatus?.meta?.model ?? metaStatus}
               </span>
             </span>
+            <DemoAccess authed={demoAuthed} onChange={setDemoAuthed} />
             <button type="button" onClick={() => setTheme(current => current === 'dark' ? 'light' : 'dark')} className="theme-toggle" aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>
               {theme === 'dark' ? <Sun className="size-4" aria-hidden="true" /> : <Moon className="size-4" aria-hidden="true" />}
               <span className="theme-toggle-label">{theme === 'dark' ? 'Light' : 'Dark'}</span>

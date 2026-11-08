@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { createRateLimiter, rateLimitOptions } from '../rate-limit.mjs'
+import { mountDemoAuth, requireDemoAuth } from '../demo-auth.mjs'
 
 // Demo spend protection: unauthenticated expensive endpoints are
 // rate-limited before their handlers run, so rejected requests can never
@@ -16,7 +17,7 @@ import {
   compareResearchEvidence
 } from '../evidence-comparison.mjs'
 import { publishAndVerify, probeWalrusAggregator, WALRUS_WRITE_ERROR_CODE } from '../walrus-storage.mjs'
-import { initStore, publicPersistenceError, PERSISTENCE_ERROR_CODE } from '../store.mjs'
+import { initStore, publicPersistenceError, PERSISTENCE_ERROR_CODE, PERSISTENCE_UNHEALTHY_CODE } from '../store.mjs'
 import { analyzeResearch, META_AI_ERROR_CODE, metaModel, metaApiBase } from '../meta-ai.mjs'
 import {
   tatumFetch,
@@ -33,6 +34,12 @@ import {
 } from '../sui-grpc-client.mjs'
 
 const router = Router()
+
+// Demo-access authentication (Phase 6B). Login/logout/status/CSRF live
+// under /auth/*; spend-bearing routes below require a session. Reads stay
+// public. Sessions are server-side and in-memory: single-replica only,
+// lost on restart.
+mountDemoAuth(router)
 
 // Walrus endpoints from official testnet specification / environment
 const DEFAULT_WALRUS_AGGREGATOR = process.env.WALRUS_AGGREGATOR_URL || process.env.WALRUS_STORAGE_URL || 'https://aggregator.walrus-testnet.walrus.space'
@@ -416,6 +423,21 @@ router.get('/health', async (_req, res) => {
   })
 })
 
+// Local-only readiness probe for platform health checks (Phase 6B).
+// Distinct from the detailed /health endpoint above: no Tatum, Meta, or
+// Walrus traffic, no database writes, no secrets, paths, or raw errors.
+// 200 only when SQLite file storage is persistent and healthy; 503 when
+// essential persistence is unavailable (including degraded memory mode).
+router.get('/health/ready', (_req, res) => {
+  const status = persistenceStore.getStatus()
+  const ready = status.persistent === true && status.healthy !== false
+  if (ready) {
+    return res.json({ ready: true, code: 'READY' })
+  }
+  const code = status.healthy === false ? PERSISTENCE_UNHEALTHY_CODE : PERSISTENCE_ERROR_CODE
+  res.status(503).json({ ready: false, code })
+})
+
 // Config status for UI badges (local configuration check only: no network
 // requests, no secret values in the response).
 router.get('/config-status', async (_req, res) => {
@@ -538,7 +560,7 @@ router.get('/sessions/:id', (req, res) => {
 
 
 
-router.post('/sessions', sessionsLimiter, async (req, res) => {
+router.post('/sessions', sessionsLimiter, requireDemoAuth(), async (req, res) => {
   const { question, network = 'mainnet' } = req.body
 
   if (!question || typeof question !== 'string' || !question.trim()) {
@@ -1002,7 +1024,7 @@ router.get('/memories', (req, res) => {
 })
 
 // Real Walrus Memory Storage: calls official Walrus Publisher HTTP PUT
-router.post('/memories', memoriesLimiter, async (req, res) => {
+router.post('/memories', memoriesLimiter, requireDemoAuth(), async (req, res) => {
   const { title, content, category = 'epistemic_stance', sourceReference = 'Manual Input' } = req.body
   if (!title || !content) {
     return res.status(400).json({ error: 'Title and content are required' })
@@ -1089,7 +1111,7 @@ const newMemory = {
 })
 
 // Real Walrus Memory Recall / Fetch from Aggregator
-router.get('/memories/walrus/:blobId', async (req, res) => {
+router.get('/memories/walrus/:blobId', requireDemoAuth(), async (req, res) => {
   const { blobId } = req.params
   if (!blobId || blobId.startsWith('demo_')) {
     return res.status(400).json({ error: 'Cannot recall demo seed blob from real Walrus nodes.' })
@@ -1134,7 +1156,7 @@ router.get('/memories/walrus/:blobId', async (req, res) => {
 // 5. Tatum Sui Direct RPC Query Verification endpoint (Read-Only)
 // --------------------------------------------------------------------------
 
-router.post('/sui/rpc', async (req, res) => {
+router.post('/sui/rpc', requireDemoAuth(), async (req, res) => {
   const {
     method = 'sui_getChainIdentifier',
     params = [],
@@ -1275,7 +1297,16 @@ router.post('/sui/rpc', async (req, res) => {
 
 
 // Detailed server-side diagnostics endpoint for Tatum Sui gRPC
-router.get('/sui/diagnostics', diagnosticsLimiter, async (_req, res) => {
+// Diagnostics stay disabled by default and their disabled response stays
+// public. When an operator explicitly enables them, the live fan-out costs
+// real quota, so authentication is required on the enabled path only.
+function requireDemoAuthWhenEnabled(req, res, next) {
+  const enabled = process.env.RECALLGUARD_ENABLE_DIAGNOSTICS === '1' ||
+    String(process.env.RECALLGUARD_ENABLE_DIAGNOSTICS).toLowerCase() === 'true'
+  if (!enabled) return next()
+  return requireDemoAuth()(req, res, next)
+}
+router.get('/sui/diagnostics', diagnosticsLimiter, requireDemoAuthWhenEnabled, async (_req, res) => {
   // Expensive diagnostics fan out to several live external services per
   // request, so they are opt-in. Safe default: disabled in demo mode.
   // To enable for local debugging, set RECALLGUARD_ENABLE_DIAGNOSTICS=1.

@@ -153,10 +153,14 @@ async function getJson(path) {
 }
 
 describe('demo hardening', () => {
-  it('binds loopback by default with no external override', () => {
+  it('binds through the environment-aware helper with no wildcard in the entry point', () => {
+    // Phase 6B: development stays loopback-only while production binds the
+    // platform interface. The contract lives in startup.mjs (covered by
+    // production.test.mjs); the entry point must not hardcode either side.
     const source = readFileSync(new URL('./index.mjs', import.meta.url), 'utf8')
-    assert.match(source, /listen\(\s*port\s*,\s*['"]127\.0\.0\.1['"]/)
-    assert.ok(!source.includes('0.0.0.0'), 'must never default to an externally reachable interface')
+    assert.ok(!source.includes('0.0.0.0'), 'must never hardcode an externally reachable interface')
+    assert.ok(!source.includes('127.0.0.1'), 'must not hardcode the loopback interface either')
+    assert.match(source, /resolveBind\(\)/, 'binding must resolve through the environment-aware helper')
   })
 
   it('rate-limits sessions and makes zero external calls when blocked', async () => {

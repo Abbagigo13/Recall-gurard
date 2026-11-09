@@ -1,0 +1,59 @@
+# Render Blueprint for RecallGuard (production migration from Railway).
+#
+# Apply from the dashboard (New + -> Blueprint -> this repo) or `render blueprint launch`.
+# Secrets are NEVER stored here: every credential uses `sync: false`, which
+# means Render prompts for / inherits the value from the dashboard at deploy
+# time. Non-secret provider settings are also dashboard-supplied so this file
+# carries no environment-specific values that could drift.
+#
+# Assumptions (verified against server/startup.mjs, server/store.mjs):
+# - The platform provides PORT; the app binds 0.0.0.0 in production.
+# - SQLite lives at RECALLGUARD_DB_PATH on the persistent disk.
+# - Outbound traffic is direct (no proxy vars set); proxy-bootstrap is a
+#   no-op without them.
+
+services:
+  - type: web
+    name: recall-guard
+    runtime: node
+    region: oregon
+    # Paid instance is required for persistent disks. Single instance only:
+    # demo-auth sessions are in-memory and SQLite is a local file, so two
+    # instances would split brain (see server/demo-auth.mjs).
+    plan: starter
+    numInstances: 1
+    buildCommand: npm install && npm run build
+    startCommand: node server/index.mjs
+    healthCheckPath: /api/recallguard/health/ready
+    disk:
+      name: recallguard-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Pin the Node runtime: node:sqlite requires Node 22.5+.
+      - key: NODE_VERSION
+        value: '22'
+      - key: RECALLGUARD_DB_PATH
+        value: /data/recallguard.db
+      # Provider settings (values entered in the dashboard; see docs/RENDER-MIGRATION.md).
+      - key: QWEN_API_BASE
+        sync: false
+      - key: QWEN_MODEL
+        sync: false
+      - key: QWEN_RESPONSE_FORMAT
+        sync: false
+      - key: META_MODEL
+        sync: false
+      - key: META_API_BASE
+        sync: false
+      # Credentials (dashboard only, never in source).
+      - key: TATUM_API_KEY
+        sync: false
+      - key: DASHSCOPE_API_KEY
+        sync: false
+      - key: META_API_KEY
+        sync: false
+      - key: RECALLGUARD_DEMO_PASSPHRASE
+        sync: false

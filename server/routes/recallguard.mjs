@@ -18,7 +18,9 @@ import {
 } from '../evidence-comparison.mjs'
 import { publishAndVerify, probeWalrusAggregator, WALRUS_WRITE_ERROR_CODE } from '../walrus-storage.mjs'
 import { initStore, publicPersistenceError, PERSISTENCE_ERROR_CODE, PERSISTENCE_UNHEALTHY_CODE } from '../store.mjs'
-import { analyzeResearch, META_AI_ERROR_CODE, metaModel, metaApiBase } from '../meta-ai.mjs'
+import { META_AI_ERROR_CODE, metaModel, metaApiBase } from '../meta-ai.mjs'
+import { resolveProviderAnalysis } from '../ai-provider.mjs'
+import { qwenModel, qwenConfigured, qwenStatus } from '../qwen-ai.mjs'
 import {
   tatumFetch,
   tatumRpc,
@@ -230,15 +232,21 @@ export function setSuiGrpcClient(client) {
   suiGrpcClient = client ?? realSuiGrpcClient
 }
 
-// Meta AI interpretation for one persisted deterministic session.
+// AI interpretation for one persisted deterministic session (Phase 7:
+// Qwen primary, Meta fallback via resolveProviderAnalysis).
 // Never throws: every outcome resolves to stable { aiStatus, aiAnalysis,
-// aiErrorCode }. The deterministic session, comparison, candidates, and
-// decisions are never touched here — AI output is interpretation only.
+// aiErrorCode, aiProvider, aiFallbackUsed }. The deterministic session,
+// comparison, candidates, and decisions are never touched here — AI output
+// is interpretation only.
 // Every attempt is audited with one ai_analyses row (UNIQUE per session):
 // the validated analysis on success, or status/model/error-code only on
-// failure. A failed audit write reports persistence_failed and withholds
-// the analysis so storage is never misrepresented.
-export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn = analyzeResearch, store = persistenceStore } = {}) {
+// failure. Provider attribution (successful provider/model, whether the
+// Meta fallback ran, sanitized per-provider outcomes) travels in the
+// audit details and the additive response fields — never inside the
+// analysis payload, which must keep the exact shared schema. A failed
+// audit write reports persistence_failed and withholds the analysis so
+// storage is never misrepresented.
+export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn = resolveProviderAnalysis, store = persistenceStore } = {}) {
   let result
   try {
     result = await analyzeFn({
@@ -252,58 +260,86 @@ export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn
     result = { ok: false, aiStatus: 'unavailable', errorCode: META_AI_ERROR_CODE, analysis: null }
   }
 
+  // Sanitized per-provider attempt outcomes for the audit record. Status
+  // and code only — never prompts, response bodies, or raw errors.
+  const attribution = {
+    fallbackUsed: Boolean(result && result.fallbackUsed),
+    qwen: result && result.qwen ? { ...result.qwen } : null,
+    meta: result && result.meta ? { ...result.meta } : null
+  }
+
   if (!result || result.ok !== true || !result.analysis) {
     const aiStatus = result && (result.aiStatus === 'invalid' || result.aiStatus === 'unavailable')
       ? result.aiStatus
       : 'unavailable'
     const errorCode = (result && result.errorCode) || META_AI_ERROR_CODE
     // Audit the failed attempt with stable fields only: status, model,
-    // provider, prompt version, timestamp, the stable error code, and
-    // sanitized validation diagnostics (field paths and rule names only).
-    // Never raw provider detail, request bodies, or model output.
+    // provider, prompt version, timestamp, the stable error code,
+    // provider attribution, and sanitized validation diagnostics (field
+    // paths and rule names only). Never raw provider detail, request
+    // bodies, or model output.
     const validationErrors = result && Array.isArray(result.validationErrors)
       ? result.validationErrors
       : []
+    // Legacy single-provider doubles carry no provider/model keys: keep
+    // the previous convention (Meta default, unknown when the provider
+    // never ran). Orchestrated results always carry an explicit provider
+    // key: the last provider that actually ran, or null when neither ran.
+    // A null provider is never remapped to Meta — it persists as the
+    // explicit 'unavailable' marker (the column is NOT NULL) and reads
+    // back as a null aiProvider.
+    const model = result && ('model' in result)
+      ? (result.model || 'unknown')
+      : (result && result.ran === false ? 'unknown' : metaModel())
+    const provider = result && ('provider' in result)
+      ? (result.provider || 'unavailable')
+      : 'meta'
     let recorded = false
     try {
       recorded = store.persistAiAnalysis({
         id: `AI-${newSession.id}`,
         sessionId: newSession.id,
-        model: result && result.ran === false ? 'unknown' : metaModel(),
-        provider: 'meta',
+        model,
+        provider,
         promptVersion: AI_PROMPT_VERSION,
         status: aiStatus,
         analysis: null,
         latencyMs: (result && result.latencyMs) ?? null,
         errorCode,
-        validationErrors
+        validationErrors,
+        ...attribution
       })
     } catch {
       recorded = false
     }
     if (!recorded) {
-      return { aiStatus: 'persistence_failed', aiAnalysis: null, aiErrorCode: PERSISTENCE_ERROR_CODE }
+      return { aiStatus: 'persistence_failed', aiAnalysis: null, aiErrorCode: PERSISTENCE_ERROR_CODE, aiProvider: null, aiFallbackUsed: null }
     }
     return {
       aiStatus,
       aiAnalysis: null,
-      aiErrorCode: errorCode
+      aiErrorCode: errorCode,
+      aiProvider: provider === 'unavailable' ? null : provider,
+      aiFallbackUsed: attribution.fallbackUsed
     }
   }
 
   const { model, provider, ...analysisBody } = result.analysis
+  const successProvider = provider || result.provider || 'qwen'
+  const successFallbackUsed = Boolean(result.fallbackUsed)
   let persisted = false
   try {
     persisted = store.persistAiAnalysis({
       id: `AI-${newSession.id}`,
       sessionId: newSession.id,
-      model: result.analysis.model,
-      provider: result.analysis.provider || 'meta',
+      model,
+      provider: successProvider,
       promptVersion: AI_PROMPT_VERSION,
       status: 'completed',
       analysis: analysisBody,
       latencyMs: result.latencyMs ?? null,
-      errorCode: null
+      errorCode: null,
+      ...attribution
     })
   } catch {
     persisted = false
@@ -312,11 +348,27 @@ export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn
     // The deterministic session stays intact; only the status reports that
     // the analysis write did not land. The analysis body is withheld so a
     // stored analysis is never implied. The code names the SQLite layer,
-    // never the Meta provider, so provider vs persistence failures stay
+    // never the AI provider, so provider vs persistence failures stay
     // distinguishable.
-    return { aiStatus: 'persistence_failed', aiAnalysis: null, aiErrorCode: PERSISTENCE_ERROR_CODE }
+    return { aiStatus: 'persistence_failed', aiAnalysis: null, aiErrorCode: PERSISTENCE_ERROR_CODE, aiProvider: null, aiFallbackUsed: null }
   }
-  return { aiStatus: 'completed', aiAnalysis: result.analysis, aiErrorCode: null }
+  return { aiStatus: 'completed', aiAnalysis: result.analysis, aiErrorCode: null, aiProvider: successProvider, aiFallbackUsed: successFallbackUsed }
+}
+
+// Read the persisted fallback flag for a session from its ai_analysis
+// audit record. Returns true/false, or null when no record exists (legacy
+// rows predate attribution). Never throws; read-only.
+function readFallbackUsed(store, sessionId) {
+  try {
+    const rows = store.listAudit(1000).filter(
+      (row) => row.action === 'ai_analysis.created' && row.entity_id === `AI-${sessionId}`
+    )
+    if (rows.length === 0) return null
+    const details = JSON.parse(rows[0].details_json || '{}')
+    return typeof details.fallbackUsed === 'boolean' ? details.fallbackUsed : null
+  } catch {
+    return null
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -461,6 +513,21 @@ router.get('/config-status', async (_req, res) => {
       model: metaModel(),
       baseUrl: metaApiBase(),
       status: metaConfigured ? 'configured' : 'missing_key'
+    },
+    // Phase 7 provider architecture (additive only; no network calls, no
+    // secrets, existing meta block unchanged). Qwen is primary, Meta is
+    // the fallback. Configured means keys/endpoints are present — never
+    // that a request succeeded.
+    ai: {
+      primary: 'qwen',
+      fallback: 'meta',
+      fallbackEnabled: true
+    },
+    qwen: {
+      configured: qwenConfigured(),
+      provider: 'qwen',
+      model: qwenModel(),
+      status: qwenStatus()
     }
   })
 })
@@ -545,7 +612,8 @@ router.get('/sessions/:id', (req, res) => {
       aiAnalysis: null,
       aiErrorCode: null,
       aiModel: null,
-      aiProvider: null
+      aiProvider: null,
+      aiFallbackUsed: null
     })
   }
   return res.json({
@@ -554,7 +622,8 @@ router.get('/sessions/:id', (req, res) => {
     aiAnalysis: recorded.analysis,
     aiErrorCode: recorded.errorCode,
     aiModel: recorded.model,
-    aiProvider: recorded.provider
+    aiProvider: recorded.provider,
+    aiFallbackUsed: readFallbackUsed(persistenceStore, session.id)
   })
 })
 
@@ -982,11 +1051,14 @@ const sourceReference =
   // aiStatus; the session, comparison, candidates, and Walrus results are
   // unaffected, and AI output can never alter them (it is not consulted
   // above this line).
-  const { aiStatus, aiAnalysis, aiErrorCode } = await resolveAiAnalysis(newSession, matchedMemories)
+  const { aiStatus, aiAnalysis, aiErrorCode, aiProvider, aiFallbackUsed } = await resolveAiAnalysis(newSession, matchedMemories)
 
   // 6. Preserve the existing API response structure (additive fields only).
   // `liveDecision` stays null on this path: only a future verified-commit
   // flow may set it. Pending work is reported via `revisionCandidate`.
+  // aiProvider/aiFallbackUsed name the successful provider and whether the
+  // Meta fallback ran; existing aiStatus/aiAnalysis/aiErrorCode are
+  // unchanged.
   res.status(201).json({
     session: newSession,
     storedMemory,
@@ -999,7 +1071,9 @@ const sourceReference =
     revisionCandidate,
     aiAnalysis,
     aiStatus,
-    aiErrorCode
+    aiErrorCode,
+    aiProvider: aiProvider ?? null,
+    aiFallbackUsed: aiFallbackUsed ?? null
   })
 })
 

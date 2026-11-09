@@ -152,6 +152,8 @@ interface ResearchResponse {
   aiAnalysis: AiAnalysis | null;
   aiStatus: string;
   aiErrorCode: string | null;
+  aiProvider?: string | null;
+  aiFallbackUsed?: boolean | null;
 }
 
 interface ResearchSession {
@@ -175,6 +177,7 @@ interface ResearchSession {
   aiErrorCode?: string | null;
   aiModel?: string | null;
   aiProvider?: string | null;
+  aiFallbackUsed?: boolean | null;
 }
 
 interface MemoryItem {
@@ -228,12 +231,27 @@ interface ConfigStatusMeta {
   status: string;
 }
 
+interface ConfigStatusQwen {
+  configured: boolean;
+  provider: string;
+  model: string;
+  status: string;
+}
+
+interface ConfigStatusAi {
+  primary: string;
+  fallback: string;
+  fallbackEnabled: boolean;
+}
+
 interface ConfigStatus {
   hasTatumKey: boolean;
   hasWalrusSdk: boolean;
   walrusPublisher: string;
   walrusAggregator: string;
   meta?: ConfigStatusMeta | null;
+  ai?: ConfigStatusAi | null;
+  qwen?: ConfigStatusQwen | null;
 }
 
 const NAV_TABS = [
@@ -919,6 +937,11 @@ const selectedRecalledMemories = selectedSession
   const metaStatus = configStatus?.meta
     ? (configStatus.meta.configured ? `${configStatus.meta.model} · ${configStatus.meta.status}` : 'No key')
     : 'Unknown';
+  // Phase 7 provider architecture: Qwen primary, Meta fallback. Configured
+  // means keys/endpoints are present — never that a request succeeded.
+  const qwenStatus = configStatus?.qwen
+    ? (configStatus.qwen.configured ? `${configStatus.qwen.model} · ${configStatus.qwen.status}` : 'No key')
+    : 'Unknown';
 
   // Landing first: no dashboard data, sidebar, or header renders here.
   if (!entered) {
@@ -987,7 +1010,8 @@ const selectedRecalledMemories = selectedSession
           <ul className="app-sidebar-infra">
             <li><span>Tatum</span><span>{tatumStatus}</span></li>
             <li><span>Walrus</span><span>{walrusStatus}</span></li>
-            <li><span>Meta</span><span>{metaStatus}</span></li>
+            <li><span>Qwen · Primary</span><span>{qwenStatus}</span></li>
+            <li><span>Meta · Fallback</span><span>{metaStatus}</span></li>
           </ul>
         </div>
 
@@ -1032,12 +1056,20 @@ const selectedRecalledMemories = selectedSession
                 Tatum: {tatumStatus}
               </span>
               <span className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium ${
+                configStatus?.qwen?.configured
+                  ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
+                  : 'border-utility-warning-200 bg-utility-warning-50 text-utility-warning-700'
+              }`} title="Qwen primary model configuration (live backend value)">
+                <span className={`size-2 rounded-full ${configStatus?.qwen?.configured ? 'bg-success-primary' : 'bg-warning-primary'}`} />
+                Qwen: {configStatus?.qwen?.model ?? qwenStatus}
+              </span>
+              <span className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium ${
                 configStatus?.meta?.configured
                   ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
                   : 'border-utility-warning-200 bg-utility-warning-50 text-utility-warning-700'
-              }`} title="Meta model configuration (live backend value)">
+              }`} title="Meta fallback model configuration (live backend value)">
                 <span className={`size-2 rounded-full ${configStatus?.meta?.configured ? 'bg-success-primary' : 'bg-warning-primary'}`} />
-                Meta: {configStatus?.meta?.model ?? metaStatus}
+                Meta · fallback: {configStatus?.meta?.model ?? metaStatus}
               </span>
             </span>
             <DemoAccess authed={demoAuthed} onChange={setDemoAuthed} />
@@ -1786,6 +1818,7 @@ const selectedRecalledMemories = selectedSession
                       <p className="text-xs text-tertiary">
                         Provider: <strong className="text-secondary">{researchResultData.aiAnalysis.provider}</strong>
                         {' '}· Model: <strong className="text-secondary">{researchResultData.aiAnalysis.model}</strong>
+                        {researchResultData.aiFallbackUsed ? ' · Meta Muse Spark · Fallback used' : (researchResultData.aiAnalysis.provider === 'qwen' ? ' · Primary' : '')}
                       </p>
                       <p className="text-sm text-primary font-medium leading-relaxed">
                         {researchResultData.aiAnalysis.interpretation}
@@ -1940,6 +1973,7 @@ const selectedRecalledMemories = selectedSession
                             <div className="space-y-xs">
                               <p className="text-xs text-secondary">
                                 {selectedSession.aiModel} via {selectedSession.aiProvider}
+                                {selectedSession.aiFallbackUsed ? ' · Fallback used' : (selectedSession.aiProvider === 'qwen' ? ' · Primary' : '')}
                               </p>
                               <p className="text-sm text-primary font-medium leading-relaxed">
                                 {selectedSession.aiAnalysis.interpretation}

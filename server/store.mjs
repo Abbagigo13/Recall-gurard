@@ -801,6 +801,10 @@ function memoryStore(db, dbPath) {
             details: {
               sessionId: record.sessionId,
               model: record.model,
+              provider: record.provider ?? 'meta',
+              fallbackUsed: record.fallbackUsed ?? false,
+              qwen: record.qwen ?? null,
+              meta: record.meta ?? null,
               validationErrors: record.validationErrors ?? []
             }
           })

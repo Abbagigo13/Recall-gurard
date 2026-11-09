@@ -172,16 +172,18 @@ describe('POST /sessions with Meta AI', () => {
     assert.equal(status, 201)
     assert.equal(body.aiStatus, 'unavailable')
     assert.equal(body.aiAnalysis, null)
-    assert.equal(body.aiErrorCode, 'META_AI_UNAVAILABLE')
+    assert.equal(body.aiErrorCode, 'QWEN_AI_UNAVAILABLE')
     // The unrun attempt is audited: model unknown, no analysis content.
+    // Neither provider ran, so none is named: the primary (Qwen) code and
+    // the explicit 'unavailable' provider replace the old Meta default.
     const rows = getPersistenceStore().listAiAnalysisBySession(body.session.id)
     assert.equal(rows.length, 1)
     assert.equal(rows[0].status, 'unavailable')
     assert.equal(rows[0].model, 'unknown')
-    assert.equal(rows[0].provider, 'meta')
+    assert.equal(rows[0].provider, 'unavailable')
     assert.equal(rows[0].promptVersion, AI_PROMPT_VERSION)
     assert.equal(rows[0].analysis, null)
-    assert.equal(rows[0].errorCode, 'META_AI_UNAVAILABLE')
+    assert.equal(rows[0].errorCode, 'QWEN_AI_UNAVAILABLE')
   })
 
   it('reports and audits invalid on 401 without retrying', async () => {
@@ -287,17 +289,17 @@ describe('POST /sessions with Meta AI', () => {
       analyzeFn: async () => ({ ok: false, aiStatus: 'invalid', errorCode: 'META_AI_INVALID', analysis: null }),
       store
     })
-    assert.deepEqual(invalid, { aiStatus: 'invalid', aiAnalysis: null, aiErrorCode: 'META_AI_INVALID' })
+    assert.deepEqual(invalid, { aiStatus: 'invalid', aiAnalysis: null, aiErrorCode: 'META_AI_INVALID', aiProvider: 'meta', aiFallbackUsed: false })
     const thrown = await resolveAiAnalysis(session, [], {
       analyzeFn: async () => { throw new Error('boom') },
       store
     })
-    assert.deepEqual(thrown, { aiStatus: 'unavailable', aiAnalysis: null, aiErrorCode: 'META_AI_UNAVAILABLE' })
+    assert.deepEqual(thrown, { aiStatus: 'unavailable', aiAnalysis: null, aiErrorCode: 'META_AI_UNAVAILABLE', aiProvider: 'meta', aiFallbackUsed: false })
     const malformed = await resolveAiAnalysis(session, [], {
       analyzeFn: async () => ({ ok: true, analysis: null }),
       store
     })
-    assert.deepEqual(malformed, { aiStatus: 'unavailable', aiAnalysis: null, aiErrorCode: 'META_AI_UNAVAILABLE' })
+    assert.deepEqual(malformed, { aiStatus: 'unavailable', aiAnalysis: null, aiErrorCode: 'META_AI_UNAVAILABLE', aiProvider: 'meta', aiFallbackUsed: false })
   })
 
   it('builds the AI prompt from session evidence only', async () => {

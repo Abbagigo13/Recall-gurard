@@ -82,6 +82,12 @@ export function classifyAggregatorProbeStatus(httpStatus) {
  * nonexistent blob. Never publishes, never writes, never throws — a
  * network failure reports `unreachable`.
  */
+// A syntactically valid but never-stored Walrus blob id (32 zero bytes in
+// base64url). The aggregator answers a well-formed missing blob with 404
+// (probe_accepted); a malformed id such as a plain word can be answered with
+// 400 instead, which showed as a misleading "probe_rejected" health badge.
+const PROBE_BLOB_ID = 'A'.repeat(43)
+
 export async function probeWalrusAggregator({
   fetchFn = fetch,
   aggregatorUrl = DEFAULT_AGGREGATOR_URL,
@@ -89,7 +95,7 @@ export async function probeWalrusAggregator({
 } = {}) {
   const started = Date.now()
   try {
-    const response = await fetchFn(`${aggregatorUrl}/v1/blobs/nonexistent_test_probe`, {
+    const response = await fetchFn(`${aggregatorUrl}/v1/blobs/${PROBE_BLOB_ID}`, {
       method: 'GET',
       signal: AbortSignal.timeout(timeoutMs)
     })

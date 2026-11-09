@@ -159,6 +159,50 @@ export async function getSuiCheckpoint(network = 'mainnet', sequenceNumber) {
 }
 
 /**
+ * Retrieve the current Sui reference gas price (denominated in MIST).
+ * The reference gas price is fixed per epoch, so the epoch number is
+ * returned with it. Read-only: uses LedgerService.GetEpoch for the current
+ * epoch and requests only the two fields needed.
+ */
+export async function getSuiReferenceGasPrice(network = 'mainnet') {
+  const metadata = getMetadata()
+  const client = createClient(network)
+
+  try {
+    const response = await callGrpc(
+      client,
+      'getEpoch',
+      {
+        readMask: {
+          paths: ['epoch', 'reference_gas_price']
+        }
+      },
+      metadata
+    )
+
+    const epoch = response?.epoch ?? null
+    const price = epoch?.referenceGasPrice
+
+    if (price === undefined || price === null || price === '') {
+      throw new Error('Reference gas price was not returned by the Sui gRPC gateway.')
+    }
+
+    return {
+      network,
+      provider: 'Tatum Sui gRPC',
+      retrievedAt: new Date().toISOString(),
+      epoch: epoch.epoch === undefined || epoch.epoch === null ? null : String(epoch.epoch),
+      referenceGasPrice: String(price),
+      unit: 'MIST',
+      evidenceStatus: 'retrieved_from_tatum',
+      cryptographicallyVerified: false
+    }
+  } finally {
+    client.close()
+  }
+}
+
+/**
  * Combined read-only health and checkpoint query.
  */
 export async function getSuiNetworkStatus(network = 'mainnet') {

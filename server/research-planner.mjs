@@ -43,6 +43,20 @@ export function buildResearchPlan(question) {
       'Do not describe retrieval as independent cryptographic verification.'
     ]
   } else if (
+    /\bgas\b/i.test(normalized) &&
+    /\b(price|prices|fee|fees)\b/i.test(normalized) &&
+    /\bsui\b/i.test(normalized)
+  ) {
+    // Checked before the checkpoint branch so "latest Sui gas price" is not
+    // mistaken for a checkpoint question.
+    capability = 'sui_reference_gas_price'
+    evidenceSources = ['tatum_sui_grpc', 'local_memory_index']
+    evidenceRequirements = [
+      'Retrieve the current Sui reference gas price (MIST) and its epoch.',
+      'Record the provider and retrieval timestamp.',
+      'Do not describe retrieval as independent cryptographic verification.'
+    ]
+  } else if (
     /\b(checkpoint|checkpoints)\b|\blatest sui\b|\bsui network status\b/i.test(normalized)
   ) {
     capability = 'sui_checkpoint_status'
@@ -124,6 +138,9 @@ export function rankMemories(question, memories, limit = 10) {
 
       case 'sui_network_status':
         return /\b(epoch|network status|service info)\b/.test(text)
+
+      case 'sui_reference_gas_price':
+        return /\bgas (price|fee)s?\b/.test(text)
 
       default:
         return true

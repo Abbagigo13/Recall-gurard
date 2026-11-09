@@ -90,6 +90,20 @@ const fakeSuiGrpcClient = {
     tatumCalls += 1
     if (tatumMode.fail) throw new Error('synthetic gRPC unavailable')
     return { digest: 'SYNTHETIC-OFFLINE-OBJECT' }
+  },
+  getSuiReferenceGasPrice: async (network) => {
+    tatumCalls += 1
+    if (tatumMode.fail) throw new Error('synthetic gRPC unavailable')
+    return {
+      network,
+      provider: 'Tatum Sui gRPC',
+      retrievedAt: new Date().toISOString(),
+      epoch: '777',
+      referenceGasPrice: '750',
+      unit: 'MIST',
+      evidenceStatus: 'retrieved_from_tatum',
+      cryptographicallyVerified: false
+    }
   }
 }
 
@@ -498,6 +512,28 @@ describe('offline research workflow', () => {
       assert.ok(CONTRACT_11.includes(claim.type), `unmapped claim type: ${claim.type}`)
       assert.equal(body.session.claims.filter((c) => c === claim).length, 1)
     }
+  })
+
+  it('Scenario 8: reference gas price research retrieves live Sui evidence', async () => {
+    const callsBefore = tatumCalls
+    const { status, body } = await postSession('What is the current Sui reference gas price?')
+    assert.equal(status, 201)
+    assertNoSecrets(JSON.stringify(body))
+
+    assert.equal(body.session.researchPlan.capability, 'sui_reference_gas_price')
+    assert.equal(tatumCalls - callsBefore, 1)
+    assert.equal(body.onChainError, null)
+
+    const evidence = body.session.onChainSuiData
+    assert.equal(evidence.operation, 'reference_gas_price')
+    assert.equal(evidence.referenceGasPrice, '750')
+    assert.equal(evidence.unit, 'MIST')
+    assert.equal(evidence.epoch, '777')
+    assert.equal(evidence.evidenceStatus, 'retrieved_from_tatum')
+    assert.equal(evidence.cryptographicallyVerified, false)
+    assert.ok(body.session.claims.some((c) => c.type === 'on_chain_observation'))
+    assert.ok(!body.session.claims.some((c) => c.type === 'evidence_retrieval_error'))
+    assert.equal(body.evidenceComparison.status, 'no_comparable_prior_evidence')
   })
 
   it('Scenario 5: persistence failure leaves no phantom session or candidate', async () => {

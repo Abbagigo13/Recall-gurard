@@ -3,7 +3,8 @@ const COMPARABLE_CAPABILITIES = new Set([
   'sui_checkpoint_status',
   'sui_chain_identifier',
   'sui_object_lookup',
-  'sui_network_status'
+  'sui_network_status',
+  'sui_reference_gas_price'
 ])
 
 function normalize(value) {
@@ -50,6 +51,14 @@ function getEvidenceIdentity(session) {
         subject: `sui:${network}:epoch`,
         property: 'epoch',
         value: evidence.serviceInfo?.epoch,
+        timestamp: evidence.retrievedAt
+      }
+
+    case 'sui_reference_gas_price':
+      return {
+        subject: `sui:${network}:gas`,
+        property: 'reference_gas_price',
+        value: evidence.referenceGasPrice,
         timestamp: evidence.retrievedAt
       }
 
@@ -175,6 +184,17 @@ export function compareResearchEvidence(newSession, previousSessions) {
         revision: null,
         comparedSessionId: previous.session.id
       }
+    }
+  }
+
+  if (current.property === 'reference_gas_price') {
+    // The reference gas price is reset every epoch and can legitimately go
+    // up or down, so a different later value is an update, not a conflict.
+    return {
+      status: 'newer_observation',
+      reason: 'The reference gas price is set per epoch and can change. This is an update, not a contradiction.',
+      revision: null,
+      comparedSessionId: previous.session.id
     }
   }
 

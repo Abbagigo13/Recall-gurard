@@ -32,7 +32,8 @@ import {
   getSuiNetworkStatus as grpcGetSuiNetworkStatus,
   getSuiServiceInfo as grpcGetSuiServiceInfo,
   getSuiCheckpoint as grpcGetSuiCheckpoint,
-  getSuiObject as grpcGetSuiObject
+  getSuiObject as grpcGetSuiObject,
+  getSuiReferenceGasPrice as grpcGetSuiReferenceGasPrice
 } from '../sui-grpc-client.mjs'
 
 const router = Router()
@@ -230,7 +231,8 @@ const realSuiGrpcClient = {
   getSuiNetworkStatus: grpcGetSuiNetworkStatus,
   getSuiServiceInfo: grpcGetSuiServiceInfo,
   getSuiCheckpoint: grpcGetSuiCheckpoint,
-  getSuiObject: grpcGetSuiObject
+  getSuiObject: grpcGetSuiObject,
+  getSuiReferenceGasPrice: grpcGetSuiReferenceGasPrice
 }
 let suiGrpcClient = realSuiGrpcClient
 export function setSuiGrpcClient(client) {
@@ -728,6 +730,21 @@ router.post('/sessions', sessionsLimiter, requireDemoAuth(), async (req, res) =>
             cryptographicallyVerified: false
           }
 
+        } else if (researchPlan.capability === 'sui_reference_gas_price') {
+          const result = await suiGrpcClient.getSuiReferenceGasPrice(network)
+
+          onChainSuiData = {
+            network: `sui-${network}`,
+            provider: result.provider ?? 'Tatum Sui gRPC',
+            operation: 'reference_gas_price',
+            referenceGasPrice: result.referenceGasPrice,
+            unit: result.unit ?? 'MIST',
+            epoch: result.epoch ?? null,
+            retrievedAt: result.retrievedAt ?? new Date().toISOString(),
+            evidenceStatus: 'retrieved_from_tatum',
+            cryptographicallyVerified: false
+          }
+
         } else if (researchPlan.capability === 'sui_object_lookup') {
           const result = await suiGrpcClient.getSuiObject(
             network,
@@ -1034,6 +1051,7 @@ const sourceReferenceByCapability = {
   sui_object_lookup: 'Tatum Sui gRPC object metadata',
   sui_chain_identifier: 'Tatum Sui gRPC chain identifier',
   sui_network_status: 'Tatum Sui gRPC network metadata',
+  sui_reference_gas_price: 'Tatum Sui gRPC reference gas price',
   memory_and_scope_analysis: 'RecallGuard Research Engine'
 }
 

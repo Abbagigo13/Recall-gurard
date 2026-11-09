@@ -180,6 +180,32 @@ describe('evidence comparison', () => {
     assert.equal(result.revision, null)
   })
 
+  it('treats a changed reference gas price as an update, not a contradiction', () => {
+    const gasSession = (id, price, timestamp) => ({
+      id,
+      provenance: 'live_production',
+      status: 'completed',
+      createdAt: timestamp,
+      researchPlan: { capability: 'sui_reference_gas_price' },
+      onChainSuiData: {
+        network: 'sui-mainnet',
+        referenceGasPrice: price,
+        retrievedAt: timestamp
+      }
+    })
+
+    const previous = gasSession('SES-GAS-1', '750', olderTime)
+    const higher = compareResearchEvidence(gasSession('SES-GAS-2', '800', newerTime), [previous])
+    const lower = compareResearchEvidence(gasSession('SES-GAS-3', '700', newerTime), [previous])
+    const same = compareResearchEvidence(gasSession('SES-GAS-4', '750', newerTime), [previous])
+
+    assert.equal(higher.status, 'newer_observation')
+    assert.equal(lower.status, 'newer_observation')
+    assert.equal(same.status, 'consistent_observation')
+    assert.equal(higher.revision, null)
+    assert.deepEqual(buildRevisionOutcome(higher), { candidate: null, committedRevision: null })
+  })
+
   it('reports a regressing checkpoint without committing a revision', () => {
     const previous = makeSession({
       id: 'SES-014',

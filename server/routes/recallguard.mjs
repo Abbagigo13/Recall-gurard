@@ -47,6 +47,11 @@ mountDemoAuth(router)
 const DEFAULT_WALRUS_AGGREGATOR = process.env.WALRUS_AGGREGATOR_URL || process.env.WALRUS_STORAGE_URL || 'https://aggregator.walrus-testnet.walrus.space'
 const DEFAULT_WALRUS_PUBLISHER = process.env.WALRUS_PUBLISHER_URL || 'https://publisher.walrus-testnet.walrus.space'
 
+// Stable public message when POST /sessions opts out of Walrus storage
+// via skipWalrus. Deliberately distinct from failure messages so a skip is
+// never mistaken for a failed or verified write.
+export const WALRUS_PUBLISH_SKIPPED_MESSAGE = 'Walrus publishing skipped by request (skipWalrus).'
+
 // Seeded DEMO historical data (explicitly labeled provenance: 'demo_seed')
 const DEMO_SESSIONS = [
   {
@@ -246,10 +251,13 @@ export function setSuiGrpcClient(client) {
 // analysis payload, which must keep the exact shared schema. A failed
 // audit write reports persistence_failed and withholds the analysis so
 // storage is never misrepresented.
-export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn = resolveProviderAnalysis, store = persistenceStore } = {}) {
+export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn = null, store = persistenceStore, noFallback = false } = {}) {
+  // An injected analyzeFn takes precedence (test seam); otherwise the
+  // orchestrator runs with fallback allowed unless the caller opted out.
+  const analyze = analyzeFn ?? ((input) => resolveProviderAnalysis(input, { allowFallback: !noFallback }))
   let result
   try {
-    result = await analyzeFn({
+    result = await analyze({
       question: newSession.question,
       capability: newSession.researchPlan?.capability,
       onChainSuiData: newSession.onChainSuiData ?? null,
@@ -264,6 +272,7 @@ export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn
   // and code only — never prompts, response bodies, or raw errors.
   const attribution = {
     fallbackUsed: Boolean(result && result.fallbackUsed),
+    fallbackDisabled: Boolean(result && result.fallbackDisabled),
     qwen: result && result.qwen ? { ...result.qwen } : null,
     meta: result && result.meta ? { ...result.meta } : null
   }
@@ -313,20 +322,22 @@ export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn
       recorded = false
     }
     if (!recorded) {
-      return { aiStatus: 'persistence_failed', aiAnalysis: null, aiErrorCode: PERSISTENCE_ERROR_CODE, aiProvider: null, aiFallbackUsed: null }
+      return { aiStatus: 'persistence_failed', aiAnalysis: null, aiErrorCode: PERSISTENCE_ERROR_CODE, aiProvider: null, aiFallbackUsed: null, aiFallbackDisabled: null }
     }
     return {
       aiStatus,
       aiAnalysis: null,
       aiErrorCode: errorCode,
       aiProvider: provider === 'unavailable' ? null : provider,
-      aiFallbackUsed: attribution.fallbackUsed
+      aiFallbackUsed: attribution.fallbackUsed,
+      aiFallbackDisabled: attribution.fallbackDisabled
     }
   }
 
   const { model, provider, ...analysisBody } = result.analysis
   const successProvider = provider || result.provider || 'qwen'
   const successFallbackUsed = Boolean(result.fallbackUsed)
+  const successFallbackDisabled = Boolean(result.fallbackDisabled)
   let persisted = false
   try {
     persisted = store.persistAiAnalysis({
@@ -350,24 +361,28 @@ export async function resolveAiAnalysis(newSession, matchedMemories, { analyzeFn
     // stored analysis is never implied. The code names the SQLite layer,
     // never the AI provider, so provider vs persistence failures stay
     // distinguishable.
-    return { aiStatus: 'persistence_failed', aiAnalysis: null, aiErrorCode: PERSISTENCE_ERROR_CODE, aiProvider: null, aiFallbackUsed: null }
+    return { aiStatus: 'persistence_failed', aiAnalysis: null, aiErrorCode: PERSISTENCE_ERROR_CODE, aiProvider: null, aiFallbackUsed: null, aiFallbackDisabled: null }
   }
-  return { aiStatus: 'completed', aiAnalysis: result.analysis, aiErrorCode: null, aiProvider: successProvider, aiFallbackUsed: successFallbackUsed }
+  return { aiStatus: 'completed', aiAnalysis: result.analysis, aiErrorCode: null, aiProvider: successProvider, aiFallbackUsed: successFallbackUsed, aiFallbackDisabled: successFallbackDisabled }
 }
 
-// Read the persisted fallback flag for a session from its ai_analysis
-// audit record. Returns true/false, or null when no record exists (legacy
-// rows predate attribution). Never throws; read-only.
-function readFallbackUsed(store, sessionId) {
+// Read the persisted fallback flags for a session from its ai_analysis
+// audit record. Returns { fallbackUsed, fallbackDisabled } with true/false
+// values, or nulls when no record exists (legacy rows predate attribution).
+// Never throws; read-only.
+function readAiAttribution(store, sessionId) {
   try {
     const rows = store.listAudit(1000).filter(
       (row) => row.action === 'ai_analysis.created' && row.entity_id === `AI-${sessionId}`
     )
-    if (rows.length === 0) return null
+    if (rows.length === 0) return { fallbackUsed: null, fallbackDisabled: null }
     const details = JSON.parse(rows[0].details_json || '{}')
-    return typeof details.fallbackUsed === 'boolean' ? details.fallbackUsed : null
+    return {
+      fallbackUsed: typeof details.fallbackUsed === 'boolean' ? details.fallbackUsed : null,
+      fallbackDisabled: typeof details.fallbackDisabled === 'boolean' ? details.fallbackDisabled : null
+    }
   } catch {
-    return null
+    return { fallbackUsed: null, fallbackDisabled: null }
   }
 }
 
@@ -613,9 +628,11 @@ router.get('/sessions/:id', (req, res) => {
       aiErrorCode: null,
       aiModel: null,
       aiProvider: null,
-      aiFallbackUsed: null
+      aiFallbackUsed: null,
+      aiFallbackDisabled: null
     })
   }
+  const attribution = readAiAttribution(persistenceStore, session.id)
   return res.json({
     ...session,
     aiStatus: recorded.status,
@@ -623,7 +640,8 @@ router.get('/sessions/:id', (req, res) => {
     aiErrorCode: recorded.errorCode,
     aiModel: recorded.model,
     aiProvider: recorded.provider,
-    aiFallbackUsed: readFallbackUsed(persistenceStore, session.id)
+    aiFallbackUsed: attribution.fallbackUsed,
+    aiFallbackDisabled: attribution.fallbackDisabled
   })
 })
 
@@ -643,6 +661,24 @@ router.post('/sessions', sessionsLimiter, requireDemoAuth(), async (req, res) =>
       error: 'Network must be mainnet or testnet.'
     })
   }
+
+  // Opt-in test controls (Phase 7K). Booleans only: any other type is
+  // rejected rather than coerced, so a string like "false" can never
+  // silently enable a skip. Both default to false, preserving the exact
+  // existing workflow for requests that omit them. Per-request locals:
+  // nothing persists between requests.
+  if (req.body.noFallback !== undefined && typeof req.body.noFallback !== 'boolean') {
+    return res.status(400).json({
+      error: 'noFallback must be a boolean'
+    })
+  }
+  if (req.body.skipWalrus !== undefined && typeof req.body.skipWalrus !== 'boolean') {
+    return res.status(400).json({
+      error: 'skipWalrus must be a boolean'
+    })
+  }
+  const noFallback = req.body.noFallback === true
+  const skipWalrus = req.body.skipWalrus === true
 
   const cleanQuestion = question.trim()
 
@@ -955,10 +991,16 @@ router.post('/sessions', sessionsLimiter, requireDemoAuth(), async (req, res) =>
     // A failed write never discards the session: it is recorded in
     // walrusStoreError while the session and its evidence stay intact.
     // Read-back equality confirms byte fidelity only, never claim truth.
-    const walrusResult = await publishAndVerify(memoryPayload, {
-      publisherUrl: DEFAULT_WALRUS_PUBLISHER,
-      aggregatorUrl: DEFAULT_WALRUS_AGGREGATOR
-    })
+    // skipWalrus short-circuits here: publishAndVerify is never called, so
+    // no publisher or aggregator contact occurs and no memory record is
+    // created below. The sentinel carries the stable skip message through
+    // the existing failure-shaped path (result null, error set).
+    const walrusResult = skipWalrus
+      ? { writeStatus: 'skipped', error: WALRUS_PUBLISH_SKIPPED_MESSAGE }
+      : await publishAndVerify(memoryPayload, {
+        publisherUrl: DEFAULT_WALRUS_PUBLISHER,
+        aggregatorUrl: DEFAULT_WALRUS_AGGREGATOR
+      })
 
     const blobId = walrusResult.blobId
     const suiObjectId = walrusResult.suiObjectId
@@ -1051,7 +1093,11 @@ const sourceReference =
   // aiStatus; the session, comparison, candidates, and Walrus results are
   // unaffected, and AI output can never alter them (it is not consulted
   // above this line).
-  const { aiStatus, aiAnalysis, aiErrorCode, aiProvider, aiFallbackUsed } = await resolveAiAnalysis(newSession, matchedMemories)
+  const { aiStatus, aiAnalysis, aiErrorCode, aiProvider, aiFallbackUsed, aiFallbackDisabled } = await resolveAiAnalysis(
+    newSession,
+    matchedMemories,
+    { noFallback }
+  )
 
   // 6. Preserve the existing API response structure (additive fields only).
   // `liveDecision` stays null on this path: only a future verified-commit
@@ -1073,7 +1119,8 @@ const sourceReference =
     aiStatus,
     aiErrorCode,
     aiProvider: aiProvider ?? null,
-    aiFallbackUsed: aiFallbackUsed ?? null
+    aiFallbackUsed: aiFallbackUsed ?? null,
+    aiFallbackDisabled: aiFallbackDisabled ?? null
   })
 })
 

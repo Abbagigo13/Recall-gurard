@@ -244,6 +244,40 @@ describe('ai-provider orchestration', () => {
     assert.equal(store.records[0].model, 'qwen3.8-flash')
   })
 
+  it('allowFallback:false with Qwen success never calls Meta', async () => {
+    let metaCalls = 0
+    const metaFn = async () => {
+      metaCalls += 1
+      return metaSuccess()()
+    }
+    const result = await resolveProviderAnalysis({ question: 'q?' }, {
+      qwenFn: qwenSuccess(), metaFn, allowFallback: false
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.provider, 'qwen')
+    assert.equal(result.fallbackUsed, false)
+    assert.equal(result.fallbackDisabled, true)
+    assert.equal(metaCalls, 0)
+  })
+
+  it('allowFallback:false with Qwen failure reports Qwen only', async () => {
+    let metaCalls = 0
+    const metaFn = async () => {
+      metaCalls += 1
+      return metaSuccess()()
+    }
+    const result = await resolveProviderAnalysis({ question: 'q?' }, {
+      qwenFn: qwenFailure(), metaFn, allowFallback: false
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.provider, 'qwen')
+    assert.equal(result.errorCode, QWEN_AI_ERROR_CODE)
+    assert.equal(result.fallbackUsed, false)
+    assert.equal(result.fallbackDisabled, true)
+    assert.equal(result.meta, null)
+    assert.equal(metaCalls, 0)
+  })
+
   it('neither provider configured records unavailable without inventing a provider', async () => {
     const store = trackingStore()
     const neverRan = async () => ({ ok: false, aiStatus: 'unavailable', errorCode: QWEN_AI_ERROR_CODE, analysis: null, ran: false })

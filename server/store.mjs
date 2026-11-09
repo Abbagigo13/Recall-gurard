@@ -803,6 +803,7 @@ function memoryStore(db, dbPath) {
               model: record.model,
               provider: record.provider ?? 'meta',
               fallbackUsed: record.fallbackUsed ?? false,
+              fallbackDisabled: record.fallbackDisabled ?? false,
               qwen: record.qwen ?? null,
               meta: record.meta ?? null,
               validationErrors: record.validationErrors ?? []

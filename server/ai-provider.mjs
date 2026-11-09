@@ -48,7 +48,7 @@ function metaOutcome(result) {
 
 export async function resolveProviderAnalysis(
   input = {},
-  { qwenFn = analyzeWithQwen, metaFn = analyzeResearch, qwenOptions = {}, metaOptions = {} } = {}
+  { qwenFn = analyzeWithQwen, metaFn = analyzeResearch, qwenOptions = {}, metaOptions = {}, allowFallback = true } = {}
 ) {
   // A. Primary first: Qwen. Never throws past the client boundary; a
   // throwing test double is treated as an unavailable attempt.
@@ -71,7 +71,33 @@ export async function resolveProviderAnalysis(
       provider: 'qwen',
       model: qwenResult.analysis.model || qwenModel(),
       fallbackUsed: false,
+      fallbackDisabled: !allowFallback,
       qwen,
+      meta: null
+    }
+  }
+
+  // B2. Fallback disabled: report the honest Qwen outcome without ever
+  // invoking Meta. The deterministic session stays intact upstream.
+  if (!allowFallback) {
+    const qwenRan = !qwenResult || qwenResult.ran !== false
+    const status = qwenResult && (qwenResult.aiStatus === 'invalid' || qwenResult.aiStatus === 'timeout' || qwenResult.aiStatus === 'unavailable')
+      ? qwenResult.aiStatus
+      : 'unavailable'
+    return {
+      ok: false,
+      aiStatus: status,
+      errorCode: (qwenResult && qwenResult.errorCode) || QWEN_AI_ERROR_CODE,
+      analysis: null,
+      validationErrors: qwenResult && Array.isArray(qwenResult.validationErrors)
+        ? qwenResult.validationErrors
+        : [],
+      latencyMs: null,
+      provider: qwenRan ? 'qwen' : null,
+      model: qwenRan ? qwenModel() : null,
+      fallbackUsed: false,
+      fallbackDisabled: true,
+      qwen: { ...qwen, ran: qwenRan },
       meta: null
     }
   }
@@ -97,6 +123,7 @@ export async function resolveProviderAnalysis(
       provider: 'meta',
       model: metaResult.analysis.model || metaModel(),
       fallbackUsed: true,
+      fallbackDisabled: false,
       qwen,
       meta
     }
@@ -132,6 +159,7 @@ export async function resolveProviderAnalysis(
     provider: metaRan ? 'meta' : (qwenRan ? 'qwen' : null),
     model: metaRan ? metaModel() : (qwenRan ? qwenModel() : null),
     fallbackUsed: metaRan,
+    fallbackDisabled: false,
     qwen: qwenFinal,
     meta: metaFinal
   }

@@ -30,7 +30,8 @@ const {
   default: router,
   resolveAiAnalysis,
   getPersistenceStore,
-  AI_PROMPT_VERSION
+  AI_PROMPT_VERSION,
+  WALRUS_PUBLISH_SKIPPED_MESSAGE
 } = await import('./routes/recallguard.mjs')
 
 function analysisJson() {
@@ -65,12 +66,24 @@ function metaFailure(status) {
 }
 
 let metaQueue = []
+let qwenQueue = []
+let metaCalls = 0
+let externalHosts = []
 const realFetch = globalThis.fetch
 globalThis.fetch = async (url, init) => {
   const target = String(url)
   if (target.includes('127.0.0.1')) return realFetch(url, init)
+  try {
+    externalHosts.push(new URL(target).hostname)
+  } catch { /* ignore */ }
   if (target.includes('api.meta.ai')) {
+    metaCalls += 1
     const next = metaQueue.shift()
+    if (next instanceof Error) throw next
+    return next
+  }
+  if (target.includes('dashscope.test')) {
+    const next = qwenQueue.shift()
     if (next instanceof Error) throw next
     return next
   }
@@ -103,13 +116,23 @@ after(async () => {
   }
 })
 
-async function postSession(question) {
+async function postSession(question, extra = {}) {
   const res = await realFetch(`${baseUrl}/api/recallguard/sessions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question })
+    body: JSON.stringify({ question, ...extra })
   })
   return { status: res.status, body: await res.json() }
+}
+
+function qwenCompletion() {
+  return {
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => ({ choices: [{ message: { content: JSON.stringify(analysisJson()) } }] }),
+    text: async () => 'unused'
+  }
 }
 
 async function getJson(path) {
@@ -118,6 +141,194 @@ async function getJson(path) {
 }
 
 const QUESTION = 'What is the latest Sui checkpoint?'
+
+// IDs of sessions created by the controls suite (which runs before the
+// Meta AI suite: the final Meta AI test leaves the store unhealthy).
+const controlSessionIds = []
+
+function resetExternalTracking() {
+  metaCalls = 0
+  externalHosts = []
+  metaQueue = []
+  qwenQueue = []
+}
+
+function useQwenStub() {
+  process.env.DASHSCOPE_API_KEY = 'test-qwen-key'
+  process.env.QWEN_API_BASE = 'https://dashscope.test/compatible-mode/v1'
+}
+
+function clearQwenStub() {
+  delete process.env.DASHSCOPE_API_KEY
+  delete process.env.QWEN_API_BASE
+}
+
+describe('POST /sessions test controls (noFallback, skipWalrus)', () => {
+  it('A. default request keeps the full workflow: Meta fallback, Walrus attempt', async () => {
+    process.env.META_API_KEY = 'test-meta-key'
+    clearQwenStub()
+    resetExternalTracking()
+    metaQueue = [metaCompletion()]
+    const { status, body } = await postSession('Default workflow check?')
+    assert.equal(status, 201)
+    assert.equal(body.aiStatus, 'completed')
+    assert.equal(body.aiProvider, 'meta')
+    assert.equal(body.aiFallbackUsed, true)
+    assert.equal(body.aiFallbackDisabled, false)
+    assert.equal(metaCalls, 1)
+    // Walrus was attempted (and failed closed in tests): the skip message
+    // must not appear, and no memory was stored.
+    assert.notEqual(body.walrusStoreError, WALRUS_PUBLISH_SKIPPED_MESSAGE)
+    assert.equal(body.storedMemory, null)
+    delete process.env.META_API_KEY
+  })
+
+  it('B. noFallback with Qwen success never contacts Meta', async () => {
+    delete process.env.META_API_KEY
+    useQwenStub()
+    resetExternalTracking()
+    qwenQueue = [qwenCompletion()]
+    const { status, body } = await postSession('Qwen-only success?', { noFallback: true })
+    assert.equal(status, 201)
+    assert.equal(body.aiStatus, 'completed')
+    assert.equal(body.aiProvider, 'qwen')
+    assert.equal(body.aiAnalysis.model, 'qwen3.8-flash')
+    assert.equal(body.aiFallbackUsed, false)
+    assert.equal(body.aiFallbackDisabled, true)
+    assert.equal(metaCalls, 0)
+    assert.deepEqual(metaQueue, [])
+    const rows = getPersistenceStore().listAiAnalysisBySession(body.session.id)
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].provider, 'qwen')
+    controlSessionIds.push(body.session.id)
+    clearQwenStub()
+  })
+
+  it('B. noFallback with Qwen failure reports honestly without Meta', async () => {
+    delete process.env.META_API_KEY
+    clearQwenStub()
+    resetExternalTracking()
+    const { status, body } = await postSession('Qwen-only failure?', { noFallback: true })
+    assert.equal(status, 201)
+    assert.equal(body.aiStatus, 'unavailable')
+    assert.equal(body.aiAnalysis, null)
+    assert.equal(body.aiProvider, null)
+    assert.equal(body.aiFallbackUsed, false)
+    assert.equal(body.aiFallbackDisabled, true)
+    assert.equal(metaCalls, 0)
+    // Deterministic session persisted despite the AI failure.
+    assert.ok(body.session.id.startsWith('SES-LIVE-'))
+    const rows = getPersistenceStore().listAiAnalysisBySession(body.session.id)
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].provider, 'unavailable')
+    controlSessionIds.push(body.session.id)
+  })
+
+  it('C. skipWalrus contacts no Walrus host and stores no memory', async () => {
+    process.env.META_API_KEY = 'test-meta-key'
+    clearQwenStub()
+    resetExternalTracking()
+    metaQueue = [metaCompletion()]
+    const memoriesBefore = (await getJson('/memories')).body.length
+    const { status, body } = await postSession('Skip Walrus?', { skipWalrus: true })
+    assert.equal(status, 201)
+    assert.equal(body.walrusStoreResult, null)
+    assert.equal(body.storedMemory, null)
+    assert.equal(body.walrusStoreError, WALRUS_PUBLISH_SKIPPED_MESSAGE)
+    assert.ok(!externalHosts.some((host) => host.includes('walrus')))
+    const memoriesAfter = (await getJson('/memories')).body.length
+    assert.equal(memoriesAfter, memoriesBefore)
+    // Session, AI analysis, and audit persistence are unaffected.
+    assert.equal(body.aiStatus, 'completed')
+    assert.equal(body.aiProvider, 'meta')
+    const rows = getPersistenceStore().listAiAnalysisBySession(body.session.id)
+    assert.equal(rows.length, 1)
+    controlSessionIds.push(body.session.id)
+    delete process.env.META_API_KEY
+  })
+
+  it('D. both flags with Qwen success: no Meta, no Walrus, full persistence', async () => {
+    delete process.env.META_API_KEY
+    useQwenStub()
+    resetExternalTracking()
+    qwenQueue = [qwenCompletion()]
+    const { status, body } = await postSession('Both flags success?', { noFallback: true, skipWalrus: true })
+    assert.equal(status, 201)
+    assert.equal(body.aiStatus, 'completed')
+    assert.equal(body.aiProvider, 'qwen')
+    assert.equal(body.aiFallbackUsed, false)
+    assert.equal(body.aiFallbackDisabled, true)
+    assert.equal(metaCalls, 0)
+    assert.equal(body.walrusStoreError, WALRUS_PUBLISH_SKIPPED_MESSAGE)
+    assert.ok(!externalHosts.some((host) => host.includes('walrus')))
+    const detail = await getJson(`/sessions/${body.session.id}`)
+    assert.equal(detail.body.aiProvider, 'qwen')
+    assert.equal(detail.body.aiFallbackUsed, false)
+    assert.equal(detail.body.aiFallbackDisabled, true)
+    controlSessionIds.push(body.session.id)
+    clearQwenStub()
+  })
+
+  it('D. both flags with Qwen failure: session and audit still correct', async () => {
+    delete process.env.META_API_KEY
+    clearQwenStub()
+    resetExternalTracking()
+    const { status, body } = await postSession('Both flags failure?', { noFallback: true, skipWalrus: true })
+    assert.equal(status, 201)
+    assert.equal(body.aiStatus, 'unavailable')
+    assert.equal(metaCalls, 0)
+    assert.equal(body.walrusStoreError, WALRUS_PUBLISH_SKIPPED_MESSAGE)
+    const audits = getPersistenceStore().listAudit(1000)
+      .filter((row) => row.entity_id === `AI-${body.session.id}`)
+    assert.equal(audits.length, 1)
+    const details = JSON.parse(audits[0].details_json)
+    assert.equal(details.fallbackUsed, false)
+    assert.equal(details.fallbackDisabled, true)
+    assert.equal(details.meta, null)
+    controlSessionIds.push(body.session.id)
+  })
+
+  it('E. rejects non-boolean flag types', async () => {
+    for (const bad of ['true', 1, 0, null, {}, []]) {
+      const r1 = await postSession('Bad noFallback?', { noFallback: bad })
+      assert.equal(r1.status, 400)
+      assert.equal(r1.body.error, 'noFallback must be a boolean')
+      const r2 = await postSession('Bad skipWalrus?', { skipWalrus: bad })
+      assert.equal(r2.status, 400)
+      assert.equal(r2.body.error, 'skipWalrus must be a boolean')
+    }
+    // Explicit false behaves exactly like omission.
+    process.env.META_API_KEY = 'test-meta-key'
+    clearQwenStub()
+    resetExternalTracking()
+    metaQueue = [metaCompletion()]
+    const { status, body } = await postSession('Explicit false?', { noFallback: false, skipWalrus: false })
+    assert.equal(status, 201)
+    assert.equal(body.aiProvider, 'meta')
+    assert.equal(body.aiFallbackUsed, true)
+    assert.notEqual(body.walrusStoreError, WALRUS_PUBLISH_SKIPPED_MESSAGE)
+    controlSessionIds.push(body.session.id)
+    delete process.env.META_API_KEY
+  })
+
+  it('F. flagged and normal sessions stay listed and readable', async () => {
+    assert.ok(controlSessionIds.length >= 6)
+    const list = await getJson('/sessions')
+    for (const id of controlSessionIds) {
+      assert.ok(list.body.some((row) => row.id === id))
+      const detail = await getJson(`/sessions/${id}`)
+      assert.equal(detail.status, 200)
+      assert.equal(detail.body.id, id)
+    }
+    for (const row of list.body) {
+      const detail = await getJson(`/sessions/${row.id}`)
+      assert.equal(detail.status, 200)
+      assert.equal(detail.body.id, row.id)
+    }
+    const memories = await getJson('/memories')
+    assert.ok(Array.isArray(memories.body))
+  })
+})
 
 describe('POST /sessions with Meta AI', () => {
   it('returns a deterministic session plus completed AI analysis', async () => {
@@ -289,17 +500,17 @@ describe('POST /sessions with Meta AI', () => {
       analyzeFn: async () => ({ ok: false, aiStatus: 'invalid', errorCode: 'META_AI_INVALID', analysis: null }),
       store
     })
-    assert.deepEqual(invalid, { aiStatus: 'invalid', aiAnalysis: null, aiErrorCode: 'META_AI_INVALID', aiProvider: 'meta', aiFallbackUsed: false })
+    assert.deepEqual(invalid, { aiStatus: 'invalid', aiAnalysis: null, aiErrorCode: 'META_AI_INVALID', aiProvider: 'meta', aiFallbackUsed: false, aiFallbackDisabled: false })
     const thrown = await resolveAiAnalysis(session, [], {
       analyzeFn: async () => { throw new Error('boom') },
       store
     })
-    assert.deepEqual(thrown, { aiStatus: 'unavailable', aiAnalysis: null, aiErrorCode: 'META_AI_UNAVAILABLE', aiProvider: 'meta', aiFallbackUsed: false })
+    assert.deepEqual(thrown, { aiStatus: 'unavailable', aiAnalysis: null, aiErrorCode: 'META_AI_UNAVAILABLE', aiProvider: 'meta', aiFallbackUsed: false, aiFallbackDisabled: false })
     const malformed = await resolveAiAnalysis(session, [], {
       analyzeFn: async () => ({ ok: true, analysis: null }),
       store
     })
-    assert.deepEqual(malformed, { aiStatus: 'unavailable', aiAnalysis: null, aiErrorCode: 'META_AI_UNAVAILABLE', aiProvider: 'meta', aiFallbackUsed: false })
+    assert.deepEqual(malformed, { aiStatus: 'unavailable', aiAnalysis: null, aiErrorCode: 'META_AI_UNAVAILABLE', aiProvider: 'meta', aiFallbackUsed: false, aiFallbackDisabled: false })
   })
 
   it('builds the AI prompt from session evidence only', async () => {

@@ -234,6 +234,75 @@ input, select, textarea { max-width: 100%; }
   position: absolute; bottom: 0; left: 0; right: 0;
   padding: 1rem; text-align: center; font-size: .72rem; color: #94A3B8;
 }
+/* ---- Landing footer links and the Docs / FAQ pages ---- */
+.landing-footer p { margin: 0; }
+.footer-links { display: flex; justify-content: center; gap: 1.5rem; margin-bottom: .5rem; }
+.footer-links a, .doc-topnav a, .doc-brand {
+  color: #CBD5E1; text-decoration: none; font-weight: 600;
+}
+.footer-links a { font-size: .8rem; }
+.footer-links a:hover, .doc-topnav a:hover, .doc-brand:hover { color: #fff; }
+.footer-links a:hover { text-decoration: underline; }
+.footer-links a:focus-visible, .doc-topnav a:focus-visible, .doc-brand:focus-visible,
+.doc-body a:focus-visible, .doc-enter:focus-visible, .doc-toc summary:focus-visible,
+.faq-item summary:focus-visible { outline: 2px solid #22D3EE; outline-offset: 3px; border-radius: .3rem; }
+.doc-root {
+  position: relative; min-height: 100vh; display: flex; flex-direction: column;
+  background: #080D18; color: #F1F5F9; overflow-x: clip;
+}
+.doc-root .landing-footer { position: relative; margin-top: auto; }
+.doc-topbar {
+  position: relative; display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; width: min(48rem, 100%); margin: 0 auto; padding: 1.25rem 1.25rem 0;
+  box-sizing: border-box;
+}
+.doc-brand { display: inline-flex; align-items: center; gap: .55rem; font-size: .95rem; font-weight: 700; }
+.doc-topnav { display: flex; align-items: center; gap: 1.1rem; font-size: .85rem; }
+.doc-topnav a[aria-current='page'] { color: #22D3EE; }
+.doc-enter {
+  padding: .45rem .9rem; border: 1px solid transparent; border-radius: .6rem;
+  background: #2878F0; color: #fff; font-size: .8rem; font-weight: 650; cursor: pointer;
+}
+.doc-enter:hover { background: #1f63cc; }
+.doc-body {
+  position: relative; width: min(48rem, 100%); margin: 0 auto; box-sizing: border-box;
+  padding: 2.5rem 1.25rem 3rem; line-height: 1.65; color: #CBD5E1;
+}
+.doc-label { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .75rem; letter-spacing: .12em; color: #22D3EE; }
+.doc-title { margin: .6rem 0 1rem; font-size: clamp(2rem, 6vw, 3rem); font-weight: 750; letter-spacing: -0.02em; line-height: 1.1; color: #F1F5F9; }
+.doc-lead { margin: 0 0 1.5rem; color: #94A3B8; font-size: 1.02rem; }
+.doc-body h2 { margin: 2.5rem 0 .75rem; font-size: 1.6rem; letter-spacing: -0.01em; color: #F1F5F9; scroll-margin-top: 1rem; }
+.doc-body p { margin: 0 0 1rem; }
+.doc-body strong { color: #F1F5F9; }
+.doc-body ol { margin: 0 0 1rem; padding-left: 1.4rem; }
+.doc-body li { margin-bottom: .55rem; }
+.doc-body a { color: #22D3EE; }
+.doc-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .88em;
+  background: rgba(148, 163, 184, .14); padding: .1rem .4rem; border-radius: .35rem;
+  overflow-wrap: anywhere;
+}
+.doc-toc { border: 1px solid rgba(148, 163, 184, .22); border-radius: .75rem; background: rgba(15, 23, 42, .6); padding: .75rem 1rem; }
+.doc-toc summary { cursor: pointer; font-weight: 650; color: #F1F5F9; }
+.doc-toc ul { margin: .6rem 0 0; padding-left: 1.2rem; }
+.doc-labels { margin: 0 0 1rem; display: grid; gap: .6rem; }
+.doc-labels > div { border: 1px solid rgba(148, 163, 184, .22); border-radius: .75rem; background: rgba(15, 23, 42, .6); padding: .75rem 1rem; }
+.doc-labels dt { font-weight: 650; color: #F1F5F9; }
+.doc-labels dd { margin: .15rem 0 0; }
+.faq-list { margin-top: 1rem; }
+.faq-item { border: 1px solid rgba(148, 163, 184, .22); border-radius: .75rem; background: rgba(15, 23, 42, .6); margin: .6rem 0; }
+.faq-item summary {
+  cursor: pointer; padding: .9rem 1.1rem; font-weight: 650; color: #F1F5F9; list-style: none;
+  display: flex; justify-content: space-between; gap: 1rem;
+}
+.faq-item summary::-webkit-details-marker { display: none; }
+.faq-item summary::after { content: '+'; color: #22D3EE; }
+.faq-item[open] summary::after { content: '\2013'; }
+.faq-item p { margin: 0; padding: 0 1.1rem 1rem; }
+@media (max-width: 560px) {
+  .doc-topnav { gap: .75rem; }
+  .doc-body { padding-top: 1.75rem; }
+}
 @media (max-width: 560px) {
   .landing-cta { width: 100%; justify-content: center; padding: .9rem 1rem; }
   .landing-root { padding: 2rem 1.25rem 4.5rem; }
